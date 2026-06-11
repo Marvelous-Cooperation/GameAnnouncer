@@ -38,13 +38,24 @@ def init_db():
             release_ts  INTEGER,
             announced   INTEGER DEFAULT 0,
             manual      INTEGER DEFAULT 0,
+            image_url   TEXT,
+            source      TEXT DEFAULT 'igdb'
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS steam_games (
+            steam_id    TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            release_ts  INTEGER,
+            announced   INTEGER DEFAULT 0,
             image_url   TEXT
         )
     """)
-    # migrate existing DBs that lack the image_url column
     cols = [r[1] for r in con.execute("PRAGMA table_info(watched_games)").fetchall()]
     if "image_url" not in cols:
         con.execute("ALTER TABLE watched_games ADD COLUMN image_url TEXT")
+    if "source" not in cols:
+        con.execute("ALTER TABLE watched_games ADD COLUMN source TEXT DEFAULT 'igdb'")
     con.execute("""
         CREATE TABLE IF NOT EXISTS config (
             guild_id    TEXT PRIMARY KEY,
@@ -69,17 +80,20 @@ def set_channel(guild_id: int, channel_id: int):
     con.close()
 
 
-def upsert_game(igdb_id: int, name: str, release_ts: int | None, manual: bool = False, image_url: str | None = None):
+def upsert_game(igdb_id: int, name: str, release_ts: int | None, manual: bool = False, image_url: str | None = None, source: str = "igdb"):
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-        INSERT INTO watched_games (igdb_id, name, release_ts, manual, image_url)
-        VALUES (?,?,?,?,?)
+        INSERT INTO watched_games (igdb_id, name, release_ts, manual, image_url, source)
+        VALUES (?,?,?,?,?,?)
         ON CONFLICT(igdb_id) DO UPDATE SET
             name=excluded.name,
             release_ts=excluded.release_ts,
             manual=MAX(manual, excluded.manual),
-            image_url=COALESCE(excluded.image_url, image_url)
-    """, (igdb_id, name, release_ts, int(manual), image_url))
+            image_url=COALESCE(excluded.image_url, image_url),
+            source=CASE WHEN excluded.source != 'igdb' AND source = 'igdb' THEN 'both'
+                        WHEN excluded.source = 'igdb' AND source != 'igdb' THEN 'both'
+                        ELSE source END
+    """, (igdb_id, name, release_ts, int(manual), image_url, source))
     con.commit()
     con.close()
 
@@ -114,6 +128,47 @@ def get_unannounced_launching_today() -> list[dict]:
 def mark_announced(igdb_id: int):
     con = sqlite3.connect(DB_PATH)
     con.execute("UPDATE watched_games SET announced=1 WHERE igdb_id=?", (igdb_id,))
+    con.commit()
+    con.close()
+
+
+def upsert_steam_game(steam_id: str, name: str, release_ts: int | None, image_url: str | None = None):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        INSERT INTO steam_games (steam_id, name, release_ts, image_url)
+        VALUES (?,?,?,?)
+        ON CONFLICT(steam_id) DO UPDATE SET
+            name=excluded.name,
+            release_ts=excluded.release_ts,
+            image_url=COALESCE(excluded.image_url, image_url)
+    """, (steam_id, name, release_ts, image_url))
+    con.commit()
+    con.close()
+
+
+def get_steam_watchlist() -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute("SELECT steam_id, name, release_ts FROM steam_games ORDER BY release_ts").fetchall()
+    con.close()
+    return [{"steam_id": r[0], "name": r[1], "release_ts": r[2]} for r in rows]
+
+
+def get_steam_launching_today() -> list[dict]:
+    now = datetime.now(timezone.utc)
+    start = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp())
+    end = start + 86400
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT steam_id, name, release_ts, image_url FROM steam_games WHERE announced=0 AND release_ts>=? AND release_ts<?",
+        (start, end)
+    ).fetchall()
+    con.close()
+    return [{"steam_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3]} for r in rows]
+
+
+def mark_steam_announced(steam_id: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE steam_games SET announced=1 WHERE steam_id=?", (steam_id,))
     con.commit()
     con.close()
 
@@ -183,6 +238,56 @@ async def fetch_high_profile_upcoming(session: aiohttp.ClientSession) -> list[di
         f"sort hypes desc; limit 50;"
     )
     return await igdb_query(session, "games", body)
+
+
+async def fetch_steam_wishlist_games(session: aiohttp.ClientSession) -> list[dict]:
+    """Scrape Steam's most wishlisted upcoming games. Returns list of {name, release_ts, image_url}."""
+    url = "https://store.steampowered.com/explore/upcoming/"
+    headers = {"Accept-Language": "en-US,en;q=0.9"}
+    try:
+        async with session.get(url, headers=headers) as resp:
+            html = await resp.text()
+    except Exception as e:
+        log.error("Failed to fetch Steam upcoming page: %s", e)
+        return []
+
+    import re
+    games = []
+
+    # Extract app IDs and names from the wishlist section
+    # Each entry looks like: data-ds-appid="XXXXXX" ... <span class="tab_item_name">Game Name</span>
+    app_blocks = re.findall(r'data-ds-appid="(\d+)".*?<span class="tab_item_name">(.*?)</span>', html, re.DOTALL)
+
+    for app_id, raw_name in app_blocks[:20]:
+        name = re.sub(r'<[^>]+>', '', raw_name).strip()
+        if not name:
+            continue
+
+        # Fetch release date and header image from Steam API
+        release_ts = None
+        image_url = None
+        try:
+            api_url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&filters=basic,release_date"
+            async with session.get(api_url) as api_resp:
+                data = await api_resp.json()
+            app_data = data.get(str(app_id), {}).get("data", {})
+            image_url = app_data.get("header_image")
+            rd = app_data.get("release_date", {})
+            if rd and not rd.get("coming_soon") and rd.get("date"):
+                try:
+                    from dateutil import parser as dateparser
+                    dt = dateparser.parse(rd["date"])
+                    if dt:
+                        release_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning("Could not fetch Steam details for app %s: %s", app_id, e)
+
+        games.append({"steam_id": app_id, "name": name, "release_ts": release_ts, "image_url": image_url})
+
+    log.info("Fetched %d games from Steam wishlist", len(games))
+    return games
 
 
 # ---------------------------------------------------------------------------
@@ -274,31 +379,35 @@ async def unwatch(ctx: commands.Context, *, game_name: str):
 @bot.command(name="watchlist")
 async def watchlist_cmd(ctx: commands.Context):
     """Show all currently watched games."""
-    games = get_watchlist()
-    if not games:
+    igdb_games = get_watchlist()
+    steam_games = get_steam_watchlist()
+
+    if not igdb_games and not steam_games:
         await ctx.send("No games on the watch list yet.")
         return
 
-    lines = []
     now_ts = datetime.now(timezone.utc).timestamp()
-    for g in games:
+
+    def date_str(release_ts):
+        if not release_ts:
+            return "TBA"
+        dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
+        prefix = "released" if release_ts < now_ts else "releases"
+        return f"{prefix} {discord.utils.format_dt(dt, 'D')}"
+
+    lines = []
+    for g in igdb_games:
         tag = "📌" if g["manual"] else "🔥"
-        if g["release_ts"]:
-            dt = datetime.fromtimestamp(g["release_ts"], tz=timezone.utc)
-            if g["release_ts"] < now_ts:
-                date_str = f"released {discord.utils.format_dt(dt, 'D')}"
-            else:
-                date_str = f"releases {discord.utils.format_dt(dt, 'D')}"
-        else:
-            date_str = "TBA"
-        lines.append(f"{tag} **{g['name']}** — {date_str}")
+        lines.append(f"{tag} **{g['name']}** — {date_str(g['release_ts'])}")
+    for g in steam_games:
+        lines.append(f"🎮 **{g['name']}** — {date_str(g['release_ts'])}")
 
     embed = discord.Embed(
         title="Game Watch List",
         description="\n".join(lines),
         color=discord.Color.blurple(),
     )
-    embed.set_footer(text="🔥 = auto-tracked high-profile  |  📌 = manually added")
+    embed.set_footer(text="🔥 = IGDB high-profile  |  📌 = manually added  |  🎮 = Steam wishlisted")
     await ctx.send(embed=embed)
 
 
@@ -352,25 +461,34 @@ async def before_daily_check():
 
 
 async def _sync_high_profile() -> int:
+    total = 0
     async with aiohttp.ClientSession() as session:
+        # IGDB
         games = await fetch_high_profile_upcoming(session)
-        if not isinstance(games, list):
+        if isinstance(games, list):
+            valid = [g for g in games if "id" in g and "name" in g]
+            for g in valid:
+                image_url = await fetch_cover_url(session, g["id"])
+                upsert_game(g["id"], g["name"], g.get("first_release_date"), manual=False, image_url=image_url, source="igdb")
+            log.info("Synced %d IGDB games", len(valid))
+            total += len(valid)
+        else:
             log.error("Unexpected IGDB response: %s", games)
-            return 0
-        valid = [g for g in games if "id" in g and "name" in g]
-        for g in valid:
-            image_url = await fetch_cover_url(session, g["id"])
-            upsert_game(g["id"], g["name"], g.get("first_release_date"), manual=False, image_url=image_url)
-    log.info("Synced %d high-profile games", len(valid))
-    return len(valid)
+
+        # Steam
+        steam_games = await fetch_steam_wishlist_games(session)
+        for g in steam_games:
+            upsert_steam_game(g["steam_id"], g["name"], g.get("release_ts"), g.get("image_url"))
+        total += len(steam_games)
+
+    return total
 
 
 async def _announce_launches():
-    launching = get_unannounced_launching_today()
+    launching = get_unannounced_launching_today() + get_steam_launching_today()
     if not launching:
         return
 
-    # Send to every configured guild channel
     con = sqlite3.connect(DB_PATH)
     channels = con.execute("SELECT channel_id FROM config").fetchall()
     con.close()
@@ -392,7 +510,10 @@ async def _announce_launches():
             if channel:
                 await channel.send(embed=embed)
 
-        mark_announced(game["igdb_id"])
+        if "igdb_id" in game:
+            mark_announced(game["igdb_id"])
+        else:
+            mark_steam_announced(game["steam_id"])
         log.info("Announced launch of %s", game["name"])
 
 
