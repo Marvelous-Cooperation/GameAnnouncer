@@ -277,17 +277,20 @@ async def fetch_steam_wishlist_games(session: aiohttp.ClientSession) -> list[dic
         if app_id:
             image_url = f"https://cdn.akamai.steamstatic.com/steam/apps/{app_id}/header.jpg"
 
-        # Release date
+        # Release date — skip vague dates like "2026" or "Q1 2026" (no specific day)
         release_ts = None
         date_tag = item.select_one(".search_released")
         if date_tag:
             date_text = date_tag.get_text(strip=True)
-            try:
-                dt = dateparser.parse(date_text)
-                if dt:
-                    release_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
-            except Exception:
-                pass
+            import re as _re
+            is_vague = bool(_re.fullmatch(r'Q?\d{1,2}\s*\d{4}|\d{4}', date_text.strip()))
+            if not is_vague:
+                try:
+                    dt = dateparser.parse(date_text)
+                    if dt:
+                        release_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+                except Exception:
+                    pass
 
         games.append({"steam_id": app_id, "name": name, "release_ts": release_ts, "image_url": image_url})
 
