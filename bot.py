@@ -402,13 +402,19 @@ async def watchlist_cmd(ctx: commands.Context):
 
     # Deduplicate: skip Steam games whose name already appears in IGDB list
     igdb_names = {g["name"].lower() for g in igdb_games}
-    lines = []
+    all_games = []
     for g in igdb_games:
-        tag = "📌" if g["manual"] else "🔥"
-        lines.append(f"{tag} **{g['name']}** — {date_str(g['release_ts'])}")
+        all_games.append({"name": g["name"], "release_ts": g["release_ts"], "tag": "📌" if g["manual"] else "🔥"})
     for g in steam_games:
         if g["name"].lower() not in igdb_names:
-            lines.append(f"🎮 **{g['name']}** — {date_str(g['release_ts'])}")
+            all_games.append({"name": g["name"], "release_ts": g["release_ts"], "tag": "🎮"})
+
+    # Sort by release date, TBA at the bottom
+    all_games.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
+
+    lines = []
+    for g in all_games:
+        lines.append(f"{g['tag']} **{g['name']}** — {date_str(g['release_ts'])}")
 
     embed = discord.Embed(
         title="Game Watch List",
