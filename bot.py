@@ -241,48 +241,53 @@ async def fetch_high_profile_upcoming(session: aiohttp.ClientSession) -> list[di
 
 
 async def fetch_steam_wishlist_games(session: aiohttp.ClientSession) -> list[dict]:
-    """Scrape Steam's most wishlisted upcoming games. Returns list of {name, release_ts, image_url}."""
-    url = "https://store.steampowered.com/explore/upcoming/"
+    """Fetch Steam's most wishlisted upcoming games via the search API."""
+    from bs4 import BeautifulSoup
+    from dateutil import parser as dateparser
+
+    url = (
+        "https://store.steampowered.com/search/results/"
+        "?filter=popularwishlist&cc=us&l=en&count=20"
+        "&category1=998&upcoming=1&infinite=1&json=1"
+    )
     headers = {"Accept-Language": "en-US,en;q=0.9"}
     try:
         async with session.get(url, headers=headers) as resp:
-            html = await resp.text()
+            data = await resp.json(content_type=None)
+        html = data.get("results_html", "")
     except Exception as e:
-        log.error("Failed to fetch Steam upcoming page: %s", e)
+        log.error("Failed to fetch Steam wishlist: %s", e)
         return []
 
-    import re
+    soup = BeautifulSoup(html, "html.parser")
+    items = soup.select("a.search_result_row")
     games = []
 
-    # Extract app IDs and names from the wishlist section
-    # Each entry looks like: data-ds-appid="XXXXXX" ... <span class="tab_item_name">Game Name</span>
-    app_blocks = re.findall(r'data-ds-appid="(\d+)".*?<span class="tab_item_name">(.*?)</span>', html, re.DOTALL)
-
-    for app_id, raw_name in app_blocks[:20]:
-        name = re.sub(r'<[^>]+>', '', raw_name).strip()
-        if not name:
+    for item in items[:20]:
+        app_id = item.get("data-ds-appid")
+        name_tag = item.select_one(".title")
+        if not app_id or not name_tag:
             continue
+        name = name_tag.get_text(strip=True)
 
-        # Fetch release date and header image from Steam API
+        # Header image from the capsule
+        img_tag = item.select_one("img")
+        image_url = img_tag["src"] if img_tag else None
+        # Use the larger header image instead of capsule thumbnail
+        if app_id:
+            image_url = f"https://cdn.akamai.steamstatic.com/steam/apps/{app_id}/header.jpg"
+
+        # Release date
         release_ts = None
-        image_url = None
-        try:
-            api_url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&filters=basic,release_date"
-            async with session.get(api_url) as api_resp:
-                data = await api_resp.json()
-            app_data = data.get(str(app_id), {}).get("data", {})
-            image_url = app_data.get("header_image")
-            rd = app_data.get("release_date", {})
-            if rd and not rd.get("coming_soon") and rd.get("date"):
-                try:
-                    from dateutil import parser as dateparser
-                    dt = dateparser.parse(rd["date"])
-                    if dt:
-                        release_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
-                except Exception:
-                    pass
-        except Exception as e:
-            log.warning("Could not fetch Steam details for app %s: %s", app_id, e)
+        date_tag = item.select_one(".search_released")
+        if date_tag:
+            date_text = date_tag.get_text(strip=True)
+            try:
+                dt = dateparser.parse(date_text)
+                if dt:
+                    release_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+            except Exception:
+                pass
 
         games.append({"steam_id": app_id, "name": name, "release_ts": release_ts, "image_url": image_url})
 
