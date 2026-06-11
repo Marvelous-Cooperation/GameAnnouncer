@@ -400,12 +400,15 @@ async def watchlist_cmd(ctx: commands.Context):
         prefix = "released" if release_ts < now_ts else "releases"
         return f"{prefix} {discord.utils.format_dt(dt, 'D')}"
 
+    # Deduplicate: skip Steam games whose name already appears in IGDB list
+    igdb_names = {g["name"].lower() for g in igdb_games}
     lines = []
     for g in igdb_games:
         tag = "📌" if g["manual"] else "🔥"
         lines.append(f"{tag} **{g['name']}** — {date_str(g['release_ts'])}")
     for g in steam_games:
-        lines.append(f"🎮 **{g['name']}** — {date_str(g['release_ts'])}")
+        if g["name"].lower() not in igdb_names:
+            lines.append(f"🎮 **{g['name']}** — {date_str(g['release_ts'])}")
 
     embed = discord.Embed(
         title="Game Watch List",
@@ -490,7 +493,10 @@ async def _sync_high_profile() -> int:
 
 
 async def _announce_launches():
-    launching = get_unannounced_launching_today() + get_steam_launching_today()
+    igdb_launching = get_unannounced_launching_today()
+    igdb_names = {g["name"].lower() for g in igdb_launching}
+    steam_launching = [g for g in get_steam_launching_today() if g["name"].lower() not in igdb_names]
+    launching = igdb_launching + steam_launching
     if not launching:
         return
 
