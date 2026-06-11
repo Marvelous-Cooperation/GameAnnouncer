@@ -204,6 +204,23 @@ async def on_ready():
 # Commands
 # ---------------------------------------------------------------------------
 
+@bot.command(name="helpGA")
+async def help_ga(ctx: commands.Context):
+    """List all GameAnnouncer commands."""
+    embed = discord.Embed(
+        title="GameAnnouncer Commands",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="!watch <game>", value="Add a game to the watch list by name.", inline=False)
+    embed.add_field(name="!unwatch <game>", value="Remove a game from the watch list.", inline=False)
+    embed.add_field(name="!watchlist", value="Show all watched games with their release dates.", inline=False)
+    embed.add_field(name="!setchannel [#channel]", value="Set the channel where launch announcements are posted. Defaults to the current channel. *(Requires Manage Channels)*", inline=False)
+    embed.add_field(name="!syncgames", value="Manually pull the latest high-profile upcoming games from IGDB. *(Requires Manage Server)*", inline=False)
+    embed.add_field(name="!testannounce", value="Send a sample launch announcement to preview what it looks like. *(Requires Manage Server)*", inline=False)
+    embed.set_footer(text="🔥 = auto-tracked high-profile  |  📌 = manually added")
+    await ctx.send(embed=embed)
+
+
 @bot.command(name="setchannel")
 @commands.has_permissions(manage_channels=True)
 async def setchannel(ctx: commands.Context, channel: discord.TextChannel | None = None):
