@@ -311,6 +311,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     log.info("Logged in as %s", bot.user)
     daily_check.start()
+    weekly_watchlist.start()
 
 
 # ---------------------------------------------------------------------------
@@ -389,43 +390,10 @@ async def watchlist_cmd(ctx: commands.Context):
     """Show all currently watched games."""
     igdb_games = get_watchlist()
     steam_games = get_steam_watchlist()
-
     if not igdb_games and not steam_games:
         await ctx.send("No games on the watch list yet.")
         return
-
-    now_ts = datetime.now(timezone.utc).timestamp()
-
-    def date_str(release_ts):
-        if not release_ts:
-            return "TBA"
-        dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
-        prefix = "released" if release_ts < now_ts else "releases"
-        return f"{prefix} {discord.utils.format_dt(dt, 'D')}"
-
-    # Deduplicate: skip Steam games whose name already appears in IGDB list
-    igdb_names = {g["name"].lower() for g in igdb_games}
-    all_games = []
-    for g in igdb_games:
-        all_games.append({"name": g["name"], "release_ts": g["release_ts"], "tag": "📌" if g["manual"] else "🔥"})
-    for g in steam_games:
-        if g["name"].lower() not in igdb_names:
-            all_games.append({"name": g["name"], "release_ts": g["release_ts"], "tag": "🎮"})
-
-    # Sort by release date, TBA at the bottom
-    all_games.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
-
-    lines = []
-    for g in all_games:
-        lines.append(f"{g['tag']} **{g['name']}** — {date_str(g['release_ts'])}")
-
-    embed = discord.Embed(
-        title="Game Watch List",
-        description="\n".join(lines),
-        color=discord.Color.blurple(),
-    )
-    embed.set_footer(text="🔥 = IGDB high-profile  |  📌 = manually added  |  🎮 = Steam wishlisted")
-    await ctx.send(embed=embed)
+    await _post_watchlist(ctx.channel)
 
 
 @bot.command(name="testannounce")
@@ -475,6 +443,68 @@ async def before_daily_check():
     wait_seconds = (midnight - now).total_seconds()
     log.info("Daily check starts in %.0f seconds", wait_seconds)
     await asyncio.sleep(wait_seconds)
+
+
+@tasks.loop(hours=168)  # weekly
+async def weekly_watchlist():
+    log.info("Posting weekly watchlist")
+    con = sqlite3.connect(DB_PATH)
+    channels = con.execute("SELECT channel_id FROM config").fetchall()
+    con.close()
+    for (channel_id,) in channels:
+        channel = bot.get_channel(int(channel_id))
+        if channel:
+            await _post_watchlist(channel)
+
+
+@weekly_watchlist.before_loop
+async def before_weekly_watchlist():
+    await bot.wait_until_ready()
+    # Wait until next Friday at 6pm EST (UTC-5, so 23:00 UTC)
+    now = datetime.now(timezone.utc)
+    days_until_friday = (4 - now.weekday()) % 7  # Friday = weekday 4
+    next_friday = (now + timedelta(days=days_until_friday)).replace(hour=23, minute=0, second=0, microsecond=0)
+    if next_friday <= now:
+        next_friday += timedelta(weeks=1)
+    wait_seconds = (next_friday - now).total_seconds()
+    log.info("Weekly watchlist posts in %.0f seconds", wait_seconds)
+    await asyncio.sleep(wait_seconds)
+
+
+async def _post_watchlist(channel: discord.TextChannel):
+    igdb_games = get_watchlist()
+    steam_games = get_steam_watchlist()
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    def date_str(release_ts):
+        if not release_ts:
+            return "TBA"
+        dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
+        prefix = "released" if release_ts < now_ts else "releases"
+        return f"{prefix} {discord.utils.format_dt(dt, 'D')}"
+
+    igdb_names = {g["name"].lower() for g in igdb_games}
+    all_games = []
+    for g in igdb_games:
+        all_games.append({"name": g["name"], "release_ts": g["release_ts"], "tag": "📌" if g["manual"] else "🔥"})
+    for g in steam_games:
+        if g["name"].lower() not in igdb_names:
+            all_games.append({"name": g["name"], "release_ts": g["release_ts"], "tag": "🎮"})
+
+    all_games.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
+
+    if not all_games:
+        return
+
+    lines = [f"{g['tag']} **{g['name']}** — {date_str(g['release_ts'])}" for g in all_games]
+    embed = discord.Embed(
+        title="Game Watch List",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="🔥 = IGDB high-profile  |  📌 = manually added  |  🎮 = Steam wishlisted")
+    await channel.send(embed=embed)
 
 
 async def _sync_high_profile() -> int:
