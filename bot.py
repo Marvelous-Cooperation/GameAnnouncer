@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
@@ -303,105 +304,103 @@ async def fetch_steam_wishlist_games(session: aiohttp.ClientSession) -> list[dic
 # ---------------------------------------------------------------------------
 
 intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="/", intents=intents)
+tree = bot.tree
 
 
 @bot.event
 async def on_ready():
     log.info("Logged in as %s", bot.user)
+    await tree.sync()
+    log.info("Slash commands synced")
     daily_check.start()
     weekly_watchlist.start()
 
 
 # ---------------------------------------------------------------------------
-# Commands
+# Slash commands
 # ---------------------------------------------------------------------------
 
-@bot.command(name="helpGA")
-async def help_ga(ctx: commands.Context):
-    """List all GameAnnouncer commands."""
-    embed = discord.Embed(
-        title="GameAnnouncer Commands",
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(name="!watch <game>", value="Add a game to the watch list by name.", inline=False)
-    embed.add_field(name="!unwatch <game>", value="Remove a game from the watch list.", inline=False)
-    embed.add_field(name="!watchlist", value="Show all watched games with their release dates.", inline=False)
-    embed.add_field(name="!setchannel [#channel]", value="Set the channel where launch announcements are posted. Defaults to the current channel. *(Requires Manage Channels)*", inline=False)
-    embed.add_field(name="!syncgames", value="Manually pull the latest high-profile upcoming games from IGDB. *(Requires Manage Server)*", inline=False)
-    embed.add_field(name="!testannounce", value="Send a sample launch announcement to preview what it looks like. *(Requires Manage Server)*", inline=False)
-    embed.set_footer(text="🔥 = auto-tracked high-profile  |  📌 = manually added")
-    await ctx.send(embed=embed)
+@tree.command(name="help", description="List all GameAnnouncer commands")
+async def slash_help(interaction: discord.Interaction):
+    embed = discord.Embed(title="GameAnnouncer Commands", color=discord.Color.blurple())
+    embed.add_field(name="/watch", value="Add a game to the watch list by name.", inline=False)
+    embed.add_field(name="/unwatch", value="Remove a game from the watch list.", inline=False)
+    embed.add_field(name="/watchlist", value="Show all watched games with their release dates.", inline=False)
+    embed.add_field(name="/setchannel", value="Set the channel where announcements are posted. *(Requires Manage Channels)*", inline=False)
+    embed.add_field(name="/syncgames", value="Manually pull the latest high-profile games from IGDB + Steam. *(Requires Manage Server)*", inline=False)
+    embed.add_field(name="/testannounce", value="Preview what a launch announcement looks like. *(Requires Manage Server)*", inline=False)
+    embed.set_footer(text="🔥 = IGDB high-profile  |  📌 = manually added  |  🎮 = Steam wishlisted")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.command(name="setchannel")
-@commands.has_permissions(manage_channels=True)
-async def setchannel(ctx: commands.Context, channel: discord.TextChannel | None = None):
-    """Set the channel where game announcements will be posted."""
-    target = channel or ctx.channel
-    set_channel(ctx.guild.id, target.id)
-    await ctx.send(f"Announcements will be posted in {target.mention}.")
+@tree.command(name="setchannel", description="Set the channel where game announcements are posted")
+@app_commands.describe(channel="Channel to post in (defaults to current channel)")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_setchannel(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+    target = channel or interaction.channel
+    set_channel(interaction.guild.id, target.id)
+    await interaction.response.send_message(f"Announcements will be posted in {target.mention}.", ephemeral=True)
 
 
-@bot.command(name="watch")
-async def watch(ctx: commands.Context, *, game_name: str):
-    """Add a game to the watch list by name."""
+@tree.command(name="watch", description="Add a game to the watch list")
+@app_commands.describe(game="Name of the game to watch")
+async def slash_watch(interaction: discord.Interaction, game: str):
+    await interaction.response.defer(ephemeral=True)
     async with aiohttp.ClientSession() as session:
-        results = await search_game(session, game_name)
+        results = await search_game(session, game)
         if not results:
-            await ctx.send(f"No games found matching **{game_name}**.")
+            await interaction.followup.send(f"No games found matching **{game}**.")
             return
-        game = results[0]
-        image_url = await fetch_cover_url(session, game["id"])
+        result = results[0]
+        image_url = await fetch_cover_url(session, result["id"])
 
-    release_ts = game.get("first_release_date")
-    upsert_game(game["id"], game["name"], release_ts, manual=True, image_url=image_url)
+    release_ts = result.get("first_release_date")
+    upsert_game(result["id"], result["name"], release_ts, manual=True, image_url=image_url)
 
     if release_ts:
         release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
-        await ctx.send(
-            f"Now watching **{game['name']}** — releases {discord.utils.format_dt(release_dt, 'D')}."
+        await interaction.followup.send(
+            f"Now watching **{result['name']}** — releases {discord.utils.format_dt(release_dt, 'D')}."
         )
     else:
-        await ctx.send(f"Now watching **{game['name']}** (no release date yet).")
+        await interaction.followup.send(f"Now watching **{result['name']}** (no release date yet).")
 
 
-@bot.command(name="unwatch")
-async def unwatch(ctx: commands.Context, *, game_name: str):
-    """Remove a game from the watch list."""
+@tree.command(name="unwatch", description="Remove a game from the watch list")
+@app_commands.describe(game="Name of the game to remove")
+async def slash_unwatch(interaction: discord.Interaction, game: str):
     watchlist = get_watchlist()
-    name_lower = game_name.lower()
+    name_lower = game.lower()
     matches = [g for g in watchlist if name_lower in g["name"].lower()]
 
     if not matches:
-        await ctx.send(f"No watched game matches **{game_name}**.")
+        await interaction.response.send_message(f"No watched game matches **{game}**.", ephemeral=True)
         return
 
     for g in matches:
         remove_game(g["igdb_id"])
 
     names = ", ".join(f"**{g['name']}**" for g in matches)
-    await ctx.send(f"Removed {names} from the watch list.")
+    await interaction.response.send_message(f"Removed {names} from the watch list.", ephemeral=True)
 
 
-@bot.command(name="watchlist")
-async def watchlist_cmd(ctx: commands.Context):
-    """Show all currently watched games."""
+@tree.command(name="watchlist", description="Show all currently watched games")
+async def slash_watchlist(interaction: discord.Interaction):
     igdb_games = get_watchlist()
     steam_games = get_steam_watchlist()
     if not igdb_games and not steam_games:
-        await ctx.send("No games on the watch list yet.")
+        await interaction.response.send_message("No games on the watch list yet.", ephemeral=True)
         return
-    await _post_watchlist(ctx.channel)
+    await interaction.response.defer()
+    await _post_watchlist(interaction.channel)
 
 
-@bot.command(name="testannounce")
-@commands.has_permissions(manage_guild=True)
-async def testannounce(ctx: commands.Context):
-    """Send a sample launch announcement to see what it looks like."""
+@tree.command(name="testannounce", description="Preview what a launch announcement looks like")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def slash_testannounce(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     async with aiohttp.ClientSession() as session:
-        # Use The Blood of Dawnwalker (id 282831) as a real example
         image_url = await fetch_cover_url(session, 282831)
     embed = discord.Embed(
         title="🎮 Game Launch Today!",
@@ -411,16 +410,25 @@ async def testannounce(ctx: commands.Context):
     embed.add_field(name="Release Date", value=discord.utils.format_dt(datetime.now(timezone.utc), "D"))
     if image_url:
         embed.set_image(url=image_url)
-    await ctx.send(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
-@bot.command(name="syncgames")
-@commands.has_permissions(manage_guild=True)
-async def syncgames(ctx: commands.Context):
-    """Manually trigger a sync of high-profile upcoming games from IGDB."""
-    await ctx.send("Syncing high-profile upcoming games from IGDB...")
+@tree.command(name="syncgames", description="Manually sync high-profile upcoming games from IGDB and Steam")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def slash_syncgames(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     count = await _sync_high_profile()
-    await ctx.send(f"Done. {count} high-profile game(s) now tracked.")
+    await interaction.followup.send(f"Done. {count} game(s) now tracked.")
+
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You don't have permission to use that command.", ephemeral=True)
+    else:
+        log.error("Slash command error: %s", error)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("An error occurred. Check the bot logs.", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -565,21 +573,6 @@ async def _announce_launches():
         else:
             mark_steam_announced(game["steam_id"])
         log.info("Announced launch of %s", game["name"])
-
-
-# ---------------------------------------------------------------------------
-# Error handling
-# ---------------------------------------------------------------------------
-
-@bot.event
-async def on_command_error(ctx: commands.Context, error: commands.CommandError):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("You don't have permission to use that command.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Missing argument: `{error.param.name}`.")
-    else:
-        log.error("Command error: %s", error)
-        await ctx.send("An error occurred. Check the bot logs.")
 
 
 # ---------------------------------------------------------------------------
