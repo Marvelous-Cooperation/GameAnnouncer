@@ -455,6 +455,8 @@ async def before_daily_check():
 
 @tasks.loop(hours=168)  # weekly
 async def weekly_watchlist():
+    log.info("Syncing games before weekly watchlist post")
+    await _sync_high_profile()
     log.info("Posting weekly watchlist")
     con = sqlite3.connect(DB_PATH)
     channels = con.execute("SELECT channel_id FROM config").fetchall()
