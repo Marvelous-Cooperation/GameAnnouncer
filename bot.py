@@ -471,9 +471,16 @@ async def before_weekly_watchlist():
     # Wait until next Friday at 6pm EST (UTC-5, so 23:00 UTC)
     now = datetime.now(timezone.utc)
     days_until_friday = (4 - now.weekday()) % 7  # Friday = weekday 4
-    next_friday = (now + timedelta(days=days_until_friday)).replace(hour=23, minute=0, second=0, microsecond=0)
-    if next_friday <= now:
-        next_friday += timedelta(weeks=1)
+    this_friday = (now + timedelta(days=days_until_friday)).replace(hour=23, minute=0, second=0, microsecond=0)
+
+    if this_friday <= now:
+        # Missed this week's window — post immediately then resume weekly cadence
+        log.info("Missed weekly watchlist window, posting now")
+        await weekly_watchlist()
+        next_friday = this_friday + timedelta(weeks=1)
+    else:
+        next_friday = this_friday
+
     wait_seconds = (next_friday - now).total_seconds()
     log.info("Weekly watchlist posts in %.0f seconds", wait_seconds)
     await asyncio.sleep(wait_seconds)
