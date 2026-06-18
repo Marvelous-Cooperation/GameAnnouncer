@@ -333,6 +333,7 @@ async def on_ready():
     log.info("Slash commands synced")
     daily_check.start()
     weekly_watchlist.start()
+    asyncio.create_task(_startup_check())
 
 
 # ---------------------------------------------------------------------------
@@ -487,15 +488,18 @@ async def daily_check():
 async def before_daily_check():
     await bot.wait_until_ready()
     now = datetime.now(timezone.utc)
-    # Run today's check immediately on startup, then align to midnight going forward
-    log.info("Running startup game check")
-    await _sync_high_profile()
-    await _announce_launches(include_overdue=True)
-    # Wait until next midnight UTC for the regular cadence
     midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     wait_seconds = (midnight - now).total_seconds()
     log.info("Next daily check in %.0f seconds", wait_seconds)
     await asyncio.sleep(wait_seconds)
+
+
+async def _startup_check():
+    """Run sync and overdue announcements in the background on startup."""
+    log.info("Running startup game check")
+    await _sync_high_profile()
+    await _announce_launches(include_overdue=True)
+    log.info("Startup check complete")
 
 
 @tasks.loop(hours=168)  # weekly
