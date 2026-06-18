@@ -376,7 +376,30 @@ async def slash_watch(interaction: discord.Interaction, game: str):
     release_ts = result.get("first_release_date")
     upsert_game(result["id"], result["name"], release_ts, manual=True, image_url=image_url)
 
-    if release_ts:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if release_ts and release_ts <= now_ts:
+        # Game already launched — announce it immediately
+        await interaction.followup.send(
+            f"**{result['name']}** has already launched! Posting announcement now..."
+        )
+        con = sqlite3.connect(DB_PATH)
+        channels = con.execute("SELECT channel_id FROM config").fetchall()
+        con.close()
+        embed = discord.Embed(
+            title="🎮 Game Launch Today!",
+            description=f"**{result['name']}** is out now!",
+            color=discord.Color.green(),
+        )
+        release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
+        embed.add_field(name="Release Date", value=discord.utils.format_dt(release_dt, "D"))
+        if image_url:
+            embed.set_image(url=image_url)
+        for (channel_id,) in channels:
+            channel = bot.get_channel(int(channel_id))
+            if channel:
+                await channel.send(embed=embed)
+        mark_announced(result["id"])
+    elif release_ts:
         release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
         await interaction.followup.send(
             f"Now watching **{result['name']}** — releases {discord.utils.format_dt(release_dt, 'D')}."
