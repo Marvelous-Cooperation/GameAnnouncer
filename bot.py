@@ -445,11 +445,15 @@ async def daily_check():
 @daily_check.before_loop
 async def before_daily_check():
     await bot.wait_until_ready()
-    # Align to midnight UTC
     now = datetime.now(timezone.utc)
+    # Run today's check immediately on startup, then align to midnight going forward
+    log.info("Running startup game check")
+    await _sync_high_profile()
+    await _announce_launches()
+    # Wait until next midnight UTC for the regular cadence
     midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     wait_seconds = (midnight - now).total_seconds()
-    log.info("Daily check starts in %.0f seconds", wait_seconds)
+    log.info("Next daily check in %.0f seconds", wait_seconds)
     await asyncio.sleep(wait_seconds)
 
 
