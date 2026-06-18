@@ -23,7 +23,7 @@ HYPE_THRESHOLD = int(os.getenv("HYPE_THRESHOLD", "50"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-DB_PATH = "games.db"
+DB_PATH = os.getenv("DB_PATH", "games.db")
 
 
 # ---------------------------------------------------------------------------
