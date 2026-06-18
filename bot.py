@@ -126,6 +126,24 @@ def get_unannounced_launching_today() -> list[dict]:
     return [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3]} for r in rows]
 
 
+def get_overdue_unannounced() -> list[dict]:
+    """Games that have already released but were never announced."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    con = sqlite3.connect(DB_PATH)
+    igdb_rows = con.execute(
+        "SELECT igdb_id, name, release_ts, image_url FROM watched_games WHERE announced=0 AND release_ts<?",
+        (now,)
+    ).fetchall()
+    steam_rows = con.execute(
+        "SELECT steam_id, name, release_ts, image_url FROM steam_games WHERE announced=0 AND release_ts<?",
+        (now,)
+    ).fetchall()
+    con.close()
+    result = [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3]} for r in igdb_rows]
+    result += [{"steam_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3]} for r in steam_rows]
+    return result
+
+
 def mark_announced(igdb_id: int):
     con = sqlite3.connect(DB_PATH)
     con.execute("UPDATE watched_games SET announced=1 WHERE igdb_id=?", (igdb_id,))
@@ -449,7 +467,7 @@ async def before_daily_check():
     # Run today's check immediately on startup, then align to midnight going forward
     log.info("Running startup game check")
     await _sync_high_profile()
-    await _announce_launches()
+    await _announce_launches(include_overdue=True)
     # Wait until next midnight UTC for the regular cadence
     midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     wait_seconds = (midnight - now).total_seconds()
@@ -552,11 +570,16 @@ async def _sync_high_profile() -> int:
     return total
 
 
-async def _announce_launches():
+async def _announce_launches(include_overdue: bool = False):
     igdb_launching = get_unannounced_launching_today()
     igdb_names = {g["name"].lower() for g in igdb_launching}
     steam_launching = [g for g in get_steam_launching_today() if g["name"].lower() not in igdb_names]
     launching = igdb_launching + steam_launching
+
+    if include_overdue:
+        today_names = {g["name"].lower() for g in launching}
+        overdue = [g for g in get_overdue_unannounced() if g["name"].lower() not in today_names]
+        launching += overdue
     if not launching:
         return
 
