@@ -107,8 +107,13 @@ def remove_game(igdb_id: int):
 
 
 def get_watchlist() -> list[dict]:
+    now = int(datetime.now(timezone.utc).timestamp())
     con = sqlite3.connect(DB_PATH)
-    rows = con.execute("SELECT igdb_id, name, release_ts, manual FROM watched_games WHERE announced=0 ORDER BY release_ts").fetchall()
+    rows = con.execute(
+        "SELECT igdb_id, name, release_ts, manual FROM watched_games "
+        "WHERE announced=0 AND (release_ts IS NULL OR release_ts > ?) ORDER BY release_ts",
+        (now,)
+    ).fetchall()
     con.close()
     return [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "manual": bool(r[3])} for r in rows]
 
@@ -166,8 +171,13 @@ def upsert_steam_game(steam_id: str, name: str, release_ts: int | None, image_ur
 
 
 def get_steam_watchlist() -> list[dict]:
+    now = int(datetime.now(timezone.utc).timestamp())
     con = sqlite3.connect(DB_PATH)
-    rows = con.execute("SELECT steam_id, name, release_ts FROM steam_games WHERE announced=0 ORDER BY release_ts").fetchall()
+    rows = con.execute(
+        "SELECT steam_id, name, release_ts FROM steam_games "
+        "WHERE announced=0 AND (release_ts IS NULL OR release_ts > ?) ORDER BY release_ts",
+        (now,)
+    ).fetchall()
     con.close()
     return [{"steam_id": r[0], "name": r[1], "release_ts": r[2]} for r in rows]
 
