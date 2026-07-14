@@ -25,6 +25,10 @@ log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DB_PATH", "games.db")
 
+# Push the watchlist to the club website after syncs/announcements (optional)
+WEBSITE_PUSH_URL = os.getenv("WEBSITE_PUSH_URL", "")
+WEBSITE_PUSH_KEY = os.getenv("WEBSITE_PUSH_KEY", "")
+
 
 # ---------------------------------------------------------------------------
 # Database
@@ -61,6 +65,11 @@ def init_db():
         con.execute("ALTER TABLE watched_games ADD COLUMN steam_app_id TEXT")
     if "platforms" not in cols:
         con.execute("ALTER TABLE watched_games ADD COLUMN platforms TEXT")
+    if "announced_at" not in cols:
+        con.execute("ALTER TABLE watched_games ADD COLUMN announced_at INTEGER")
+    steam_cols = [r[1] for r in con.execute("PRAGMA table_info(steam_games)").fetchall()]
+    if "announced_at" not in steam_cols:
+        con.execute("ALTER TABLE steam_games ADD COLUMN announced_at INTEGER")
     con.execute("""
         CREATE TABLE IF NOT EXISTS config (
             guild_id    TEXT PRIMARY KEY,
@@ -157,7 +166,8 @@ def get_overdue_unannounced() -> list[dict]:
 
 def mark_announced(igdb_id: int):
     con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE watched_games SET announced=1 WHERE igdb_id=?", (igdb_id,))
+    con.execute("UPDATE watched_games SET announced=1, announced_at=? WHERE igdb_id=?",
+                (int(datetime.now(timezone.utc).timestamp()), igdb_id))
     con.commit()
     con.close()
 
@@ -203,7 +213,8 @@ def get_steam_launching_today() -> list[dict]:
 
 def mark_steam_announced(steam_id: str):
     con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE steam_games SET announced=1 WHERE steam_id=?", (steam_id,))
+    con.execute("UPDATE steam_games SET announced=1, announced_at=? WHERE steam_id=?",
+                (int(datetime.now(timezone.utc).timestamp()), steam_id))
     con.commit()
     con.close()
 
@@ -466,6 +477,7 @@ async def slash_watch(interaction: discord.Interaction, game: str):
         )
     else:
         await interaction.followup.send(f"Now watching **{result['name']}** (no release date yet).")
+    await push_watchlist_to_website()
 
 
 @tree.command(name="unwatch", description="Remove a game from the watch list")
@@ -484,6 +496,7 @@ async def slash_unwatch(interaction: discord.Interaction, game: str):
 
     names = ", ".join(f"**{g['name']}**" for g in matches)
     await interaction.response.send_message(f"Removed {names} from the watch list.", ephemeral=True)
+    await push_watchlist_to_website()
 
 
 @tree.command(name="watchlist", description="Show all currently watched games (private — only you can see it)")
@@ -527,6 +540,7 @@ async def slash_testannounce(interaction: discord.Interaction):
 async def slash_syncgames(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     count = await _sync_high_profile()
+    await push_watchlist_to_website()
     await interaction.followup.send(f"Done. {count} game(s) now tracked.")
 
 
@@ -549,6 +563,7 @@ async def daily_check():
     log.info("Running daily game check")
     await _sync_high_profile()
     await _announce_launches()
+    await push_watchlist_to_website()
 
 
 @daily_check.before_loop
@@ -566,6 +581,7 @@ async def _startup_check():
     log.info("Running startup game check")
     await _sync_high_profile()
     await _announce_launches(include_overdue=True)
+    await push_watchlist_to_website()
     log.info("Startup check complete")
 
 
@@ -581,6 +597,7 @@ async def weekly_watchlist():
         channel = bot.get_channel(int(channel_id))
         if channel:
             await _post_watchlist(channel)
+    await push_watchlist_to_website()
 
 
 @weekly_watchlist.before_loop
@@ -661,6 +678,73 @@ async def _post_watchlist(channel: discord.TextChannel):
     embed = _build_watchlist_embed()
     if embed:
         await channel.send(embed=embed)
+
+
+def _build_site_payload() -> dict:
+    """Watchlist + most recently announced game, for the club website."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    con = sqlite3.connect(DB_PATH)
+
+    igdb_rows = con.execute(
+        "SELECT name, release_ts, manual, image_url, steam_app_id, platforms FROM watched_games "
+        "WHERE announced=0 AND (release_ts IS NULL OR release_ts > ?) ORDER BY release_ts",
+        (now_ts,),
+    ).fetchall()
+    steam_rows = con.execute(
+        "SELECT name, release_ts, image_url, steam_id FROM steam_games "
+        "WHERE announced=0 AND (release_ts IS NULL OR release_ts > ?) ORDER BY release_ts",
+        (now_ts,),
+    ).fetchall()
+
+    upcoming = [
+        {"name": r[0], "release_ts": r[1], "tag": "manual" if r[2] else "igdb",
+         "image_url": r[3], "steam_app_id": r[4], "platforms": r[5]}
+        for r in igdb_rows
+    ]
+    seen = {g["name"].lower() for g in upcoming}
+    upcoming += [
+        {"name": r[0], "release_ts": r[1], "tag": "steam",
+         "image_url": r[2], "steam_app_id": r[3], "platforms": None}
+        for r in steam_rows if r[0].lower() not in seen
+    ]
+    upcoming.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
+
+    featured = None
+    candidates = con.execute(
+        "SELECT name, release_ts, image_url, COALESCE(announced_at, release_ts) AS at "
+        "FROM watched_games WHERE announced=1 "
+        "UNION ALL "
+        "SELECT name, release_ts, image_url, COALESCE(announced_at, release_ts) AS at "
+        "FROM steam_games WHERE announced=1 "
+        "ORDER BY at DESC LIMIT 1"
+    ).fetchone()
+    con.close()
+    if candidates:
+        featured = {"name": candidates[0], "release_ts": candidates[1],
+                    "image_url": candidates[2], "announced_at": candidates[3]}
+
+    return {"featured": featured, "upcoming": upcoming}
+
+
+async def push_watchlist_to_website():
+    """Send the current watchlist to the club website. No-op if unconfigured."""
+    if not (WEBSITE_PUSH_URL and WEBSITE_PUSH_KEY):
+        return
+    payload = _build_site_payload()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                WEBSITE_PUSH_URL,
+                json=payload,
+                headers={"X-Api-Key": WEBSITE_PUSH_KEY},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    log.info("Pushed watchlist to website (%d upcoming)", len(payload["upcoming"]))
+                else:
+                    log.warning("Website push failed: HTTP %s", resp.status)
+    except Exception as exc:
+        log.warning("Website push failed: %s", exc)
 
 
 async def _sync_high_profile() -> int:
