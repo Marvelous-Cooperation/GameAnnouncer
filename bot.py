@@ -285,8 +285,8 @@ async def fetch_store_info_batch(session: aiohttp.ClientSession, igdb_ids: list[
         return {}
     id_list = ",".join(str(i) for i in igdb_ids)
 
-    # Single call for all Steam app IDs
-    ext_rows = await igdb_query(session, "external_games", f"fields game,uid; where game=({id_list}) & category=1; limit 500;")
+    # Single call for all Steam app IDs (IGDB renamed 'category' to 'external_game_source')
+    ext_rows = await igdb_query(session, "external_games", f"fields game,uid; where game=({id_list}) & external_game_source=1; limit 500;")
     steam_map = {r["game"]: str(r["uid"]) for r in ext_rows if "game" in r and "uid" in r}
 
     # Single call for all platform lists (already have them from the games query but re-fetch to be safe)
@@ -769,6 +769,26 @@ async def _sync_high_profile() -> int:
         for g in steam_games:
             upsert_steam_game(g["steam_id"], g["name"], g.get("release_ts"), g.get("image_url"))
         total += len(steam_games)
+
+        # Backfill store info for tracked games that are missing it (e.g. manual adds,
+        # or games synced while the external_games query was broken)
+        con = sqlite3.connect(DB_PATH)
+        missing = [r[0] for r in con.execute(
+            "SELECT igdb_id FROM watched_games WHERE announced=0 AND steam_app_id IS NULL"
+        ).fetchall()]
+        con.close()
+        if missing:
+            info = await fetch_store_info_batch(session, missing)
+            con = sqlite3.connect(DB_PATH)
+            for gid, (app_id, platforms) in info.items():
+                con.execute(
+                    "UPDATE watched_games SET steam_app_id=COALESCE(?, steam_app_id), "
+                    "platforms=COALESCE(?, platforms) WHERE igdb_id=?",
+                    (app_id, platforms, gid),
+                )
+            con.commit()
+            con.close()
+            log.info("Backfilled store info for %d games", len(missing))
 
     return total
 
