@@ -1,6 +1,7 @@
 import os
 import asyncio
 import aiohttp
+import re
 import sqlite3
 import logging
 import urllib.parse
@@ -312,6 +313,82 @@ def _nintendo_search_url(name: str) -> str:
     return "https://www.nintendo.com/us/search/#q=" + urllib.parse.quote(name) + "&f=games"
 
 
+# ---- direct store-page resolvers (unofficial storefront search APIs) ----
+
+_BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+
+def _norm_title(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _titles_match(a: str, b: str) -> bool:
+    na, nb = _norm_title(a), _norm_title(b)
+    return bool(na and nb) and (na == nb or na in nb or nb in na)
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", name.lower())).strip("-") or "game"
+
+
+async def _resolve_xbox(session: aiohttp.ClientSession, name: str) -> str | None:
+    """Direct xbox.com store page via the Microsoft display catalog."""
+    try:
+        url = ("https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/autosuggest"
+               f"?market=US&languages=en-us&query={urllib.parse.quote(name)}&productFamilyNames=Games")
+        async with session.get(url, headers=_BROWSER_UA, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        for result in data.get("Results", []):
+            for product in result.get("Products", []):
+                title, pid = product.get("Title", ""), product.get("ProductId")
+                if pid and _titles_match(name, title):
+                    return f"https://www.xbox.com/en-US/games/store/{_slugify(title)}/{pid}"
+    except Exception:
+        pass
+    return None
+
+
+async def _resolve_ps(session: aiohttp.ClientSession, name: str) -> str | None:
+    """Direct PlayStation store concept page, scraped from store search results."""
+    try:
+        url = "https://store.playstation.com/en-us/search/" + urllib.parse.quote(name)
+        async with session.get(url, headers=_BROWSER_UA, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text()
+        for m in re.finditer(r'href="(/en-us/(?:concept|product)/[\w\-]+)"(.{0,500}?)</a>', html, re.S):
+            text = re.sub(r"<[^>]+>", " ", m.group(2))
+            if _titles_match(name, text):
+                return "https://store.playstation.com" + m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+async def _resolve_nintendo(session: aiohttp.ClientSession, name: str) -> str | None:
+    """Direct nintendo.com product page via Nintendo's public search index."""
+    try:
+        async with session.post(
+            "https://u3b6gr4ua3-dsn.algolia.net/1/indexes/store_all_products_en_us/query",
+            headers={"x-algolia-application-id": "U3B6GR4UA3",
+                     "x-algolia-api-key": "a29c6927638bfd8cee23993e51e721c9",
+                     **_BROWSER_UA},
+            json={"query": name, "hitsPerPage": 5},
+            timeout=aiohttp.ClientTimeout(total=12),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        for hit in data.get("hits", []):
+            if hit.get("url") and _titles_match(name, hit.get("title", "")):
+                return "https://www.nintendo.com" + hit["url"]
+    except Exception:
+        pass
+    return None
+
+
 async def fetch_store_info_batch(session: aiohttp.ClientSession, igdb_ids: list[int]) -> dict[int, tuple]:
     """Batch fetch (steam_app_id, platforms_str, ps_url, xbox_url, nsw_url, web_url) in 3 API calls.
 
@@ -357,8 +434,9 @@ async def fetch_store_info_batch(session: aiohttp.ClientSession, igdb_ids: list[
     plat_rows = await igdb_query(session, "games", f"fields id,name,platforms,url; where id=({id_list}); limit 500;")
     plat_map = {r["id"]: r for r in plat_rows if "id" in r}
 
-    result = {}
-    for igdb_id in igdb_ids:
+    sem = asyncio.Semaphore(4)
+
+    async def build(igdb_id):
         row = plat_map.get(igdb_id, {})
         platform_ids = row.get("platforms", [])
         name = row.get("name", "")
@@ -367,12 +445,30 @@ async def fetch_store_info_batch(session: aiohttp.ClientSession, igdb_ids: list[
         has_ps = any(b in ("PS4", "PS5") for b in badges)
         has_xbox = any(b in ("XB1", "XSX") for b in badges)
         has_nsw = any(b in ("NSW", "NSW2") for b in badges)
-        ps_url = ps_map.get(igdb_id) or (_ps_search_url(name) if has_ps and name else None)
-        xbox_url = xbox_map.get(igdb_id) or (_xbox_search_url(name) if has_xbox and name else None)
-        nsw_url = nsw_map.get(igdb_id) or (_nintendo_search_url(name) if has_nsw and name else None)
+
+        # direct page from IGDB, else resolve against the storefront itself,
+        # else fall back to a storefront search
+        ps_url = ps_map.get(igdb_id)
+        if not ps_url and has_ps and name:
+            async with sem:
+                ps_url = await _resolve_ps(session, name)
+            ps_url = ps_url or _ps_search_url(name)
+        xbox_url = xbox_map.get(igdb_id)
+        if not xbox_url and has_xbox and name:
+            async with sem:
+                xbox_url = await _resolve_xbox(session, name)
+            xbox_url = xbox_url or _xbox_search_url(name)
+        nsw_url = nsw_map.get(igdb_id)
+        if not nsw_url and has_nsw and name:
+            async with sem:
+                nsw_url = await _resolve_nintendo(session, name)
+            nsw_url = nsw_url or _nintendo_search_url(name)
+
         web_url = official_map.get(igdb_id) or row.get("url")
-        result[igdb_id] = (steam_map.get(igdb_id), platforms_str, ps_url, xbox_url, nsw_url, web_url)
-    return result
+        return igdb_id, (steam_map.get(igdb_id), platforms_str, ps_url, xbox_url, nsw_url, web_url)
+
+    pairs = await asyncio.gather(*(build(i) for i in igdb_ids))
+    return dict(pairs)
 
 
 async def fetch_game_store_info(session: aiohttp.ClientSession, igdb_id: int) -> tuple:
@@ -883,7 +979,10 @@ async def _sync_high_profile() -> int:
         con = sqlite3.connect(DB_PATH)
         missing = [r[0] for r in con.execute(
             "SELECT igdb_id FROM watched_games WHERE announced=0 AND "
-            "(steam_app_id IS NULL OR ps_url IS NULL OR xbox_url IS NULL OR web_url IS NULL)"
+            "(steam_app_id IS NULL OR ps_url IS NULL OR xbox_url IS NULL OR web_url IS NULL "
+            " OR ps_url LIKE '%store.playstation.com/en-us/search/%' "
+            " OR xbox_url LIKE '%xbox.com/en-us/search%' "
+            " OR nsw_url LIKE '%nintendo.com/us/search%')"
         ).fetchall()]
         con.close()
         if missing:
