@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import sqlite3
 import logging
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -67,6 +68,10 @@ def init_db():
         con.execute("ALTER TABLE watched_games ADD COLUMN platforms TEXT")
     if "announced_at" not in cols:
         con.execute("ALTER TABLE watched_games ADD COLUMN announced_at INTEGER")
+    if "ps_url" not in cols:
+        con.execute("ALTER TABLE watched_games ADD COLUMN ps_url TEXT")
+    if "xbox_url" not in cols:
+        con.execute("ALTER TABLE watched_games ADD COLUMN xbox_url TEXT")
     steam_cols = [r[1] for r in con.execute("PRAGMA table_info(steam_games)").fetchall()]
     if "announced_at" not in steam_cols:
         con.execute("ALTER TABLE steam_games ADD COLUMN announced_at INTEGER")
@@ -94,11 +99,11 @@ def set_channel(guild_id: int, channel_id: int):
     con.close()
 
 
-def upsert_game(igdb_id: int, name: str, release_ts: int | None, manual: bool = False, image_url: str | None = None, source: str = "igdb", steam_app_id: str | None = None, platforms: str | None = None):
+def upsert_game(igdb_id: int, name: str, release_ts: int | None, manual: bool = False, image_url: str | None = None, source: str = "igdb", steam_app_id: str | None = None, platforms: str | None = None, ps_url: str | None = None, xbox_url: str | None = None):
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-        INSERT INTO watched_games (igdb_id, name, release_ts, manual, image_url, source, steam_app_id, platforms)
-        VALUES (?,?,?,?,?,?,?,?)
+        INSERT INTO watched_games (igdb_id, name, release_ts, manual, image_url, source, steam_app_id, platforms, ps_url, xbox_url)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(igdb_id) DO UPDATE SET
             name=excluded.name,
             release_ts=excluded.release_ts,
@@ -108,8 +113,10 @@ def upsert_game(igdb_id: int, name: str, release_ts: int | None, manual: bool = 
                         WHEN excluded.source = 'igdb' AND source != 'igdb' THEN 'both'
                         ELSE source END,
             steam_app_id=COALESCE(excluded.steam_app_id, steam_app_id),
-            platforms=COALESCE(excluded.platforms, platforms)
-    """, (igdb_id, name, release_ts, int(manual), image_url, source, steam_app_id, platforms))
+            platforms=COALESCE(excluded.platforms, platforms),
+            ps_url=COALESCE(excluded.ps_url, ps_url),
+            xbox_url=COALESCE(excluded.xbox_url, xbox_url)
+    """, (igdb_id, name, release_ts, int(manual), image_url, source, steam_app_id, platforms, ps_url, xbox_url))
     con.commit()
     con.close()
 
@@ -125,12 +132,13 @@ def get_watchlist() -> list[dict]:
     now = int(datetime.now(timezone.utc).timestamp())
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        "SELECT igdb_id, name, release_ts, manual, steam_app_id, platforms FROM watched_games "
+        "SELECT igdb_id, name, release_ts, manual, steam_app_id, platforms, ps_url, xbox_url FROM watched_games "
         "WHERE announced=0 AND (release_ts IS NULL OR release_ts > ?) ORDER BY release_ts",
         (now,)
     ).fetchall()
     con.close()
-    return [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "manual": bool(r[3]), "steam_app_id": r[4], "platforms": r[5]} for r in rows]
+    return [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "manual": bool(r[3]),
+             "steam_app_id": r[4], "platforms": r[5], "ps_url": r[6], "xbox_url": r[7]} for r in rows]
 
 
 def get_unannounced_launching_today() -> list[dict]:
@@ -279,34 +287,69 @@ PLATFORM_LABELS = {
 }
 
 
-async def fetch_store_info_batch(session: aiohttp.ClientSession, igdb_ids: list[int]) -> dict[int, tuple[str | None, str | None]]:
-    """Batch fetch (steam_app_id, platforms_str) for multiple games in 2 API calls."""
+# external_game_source ids: 1=Steam, 11=Microsoft, 31=Xbox Marketplace, 36=PlayStation Store
+PS_SOURCES = {36}
+XBOX_SOURCES = {11, 31}
+
+
+def _ps_search_url(name: str) -> str:
+    return "https://store.playstation.com/en-us/search/" + urllib.parse.quote(name)
+
+
+def _xbox_search_url(name: str) -> str:
+    return "https://www.xbox.com/en-us/search/results/games?q=" + urllib.parse.quote(name)
+
+
+async def fetch_store_info_batch(session: aiohttp.ClientSession, igdb_ids: list[int]) -> dict[int, tuple[str | None, str | None, str | None, str | None]]:
+    """Batch fetch (steam_app_id, platforms_str, ps_url, xbox_url) in 2 API calls.
+
+    PS/Xbox links use the direct store page when IGDB has one, otherwise fall
+    back to a storefront search for the game name (only when the game actually
+    has a badge for that platform).
+    """
     if not igdb_ids:
         return {}
     id_list = ",".join(str(i) for i in igdb_ids)
 
-    # Single call for all Steam app IDs (IGDB renamed 'category' to 'external_game_source')
-    ext_rows = await igdb_query(session, "external_games", f"fields game,uid; where game=({id_list}) & external_game_source=1; limit 500;")
-    steam_map = {r["game"]: str(r["uid"]) for r in ext_rows if "game" in r and "uid" in r}
+    # Single call for all store entries (IGDB renamed 'category' to 'external_game_source')
+    ext_rows = await igdb_query(
+        session, "external_games",
+        f"fields game,uid,url,external_game_source; where game=({id_list}) & external_game_source=(1,11,31,36); limit 500;",
+    )
+    steam_map, ps_map, xbox_map = {}, {}, {}
+    for r in ext_rows:
+        gid, src = r.get("game"), r.get("external_game_source")
+        if gid is None:
+            continue
+        if src == 1 and r.get("uid"):
+            steam_map[gid] = str(r["uid"])
+        elif src in PS_SOURCES and r.get("url"):
+            ps_map[gid] = r["url"]
+        elif src in XBOX_SOURCES and r.get("url"):
+            xbox_map[gid] = r["url"]
 
-    # Single call for all platform lists (already have them from the games query but re-fetch to be safe)
-    plat_rows = await igdb_query(session, "games", f"fields id,platforms; where id=({id_list}); limit 500;")
-    plat_map = {r["id"]: r.get("platforms", []) for r in plat_rows if "id" in r}
+    plat_rows = await igdb_query(session, "games", f"fields id,name,platforms; where id=({id_list}); limit 500;")
+    plat_map = {r["id"]: r for r in plat_rows if "id" in r}
 
     result = {}
     for igdb_id in igdb_ids:
-        steam_app_id = steam_map.get(igdb_id)
-        platform_ids = plat_map.get(igdb_id, [])
+        row = plat_map.get(igdb_id, {})
+        platform_ids = row.get("platforms", [])
+        name = row.get("name", "")
         badges = [PLATFORM_LABELS[p] for p in platform_ids if p in PLATFORM_LABELS and PLATFORM_LABELS[p]]
         platforms_str = ",".join(sorted(set(badges))) if badges else None
-        result[igdb_id] = (steam_app_id, platforms_str)
+        has_ps = any(b in ("PS4", "PS5") for b in badges)
+        has_xbox = any(b in ("XB1", "XSX") for b in badges)
+        ps_url = ps_map.get(igdb_id) or (_ps_search_url(name) if has_ps and name else None)
+        xbox_url = xbox_map.get(igdb_id) or (_xbox_search_url(name) if has_xbox and name else None)
+        result[igdb_id] = (steam_map.get(igdb_id), platforms_str, ps_url, xbox_url)
     return result
 
 
-async def fetch_game_store_info(session: aiohttp.ClientSession, igdb_id: int) -> tuple[str | None, str | None]:
-    """Return (steam_app_id, platforms_str) for a single game."""
+async def fetch_game_store_info(session: aiohttp.ClientSession, igdb_id: int) -> tuple[str | None, str | None, str | None, str | None]:
+    """Return (steam_app_id, platforms_str, ps_url, xbox_url) for a single game."""
     results = await fetch_store_info_batch(session, [igdb_id])
-    return results.get(igdb_id, (None, None))
+    return results.get(igdb_id, (None, None, None, None))
 
 
 async def search_game(session: aiohttp.ClientSession, name: str) -> list[dict]:
@@ -442,10 +485,10 @@ async def slash_watch(interaction: discord.Interaction, game: str):
             return
         result = results[0]
         image_url = await fetch_cover_url(session, result["id"])
-        steam_app_id, platforms = await fetch_game_store_info(session, result["id"])
+        steam_app_id, platforms, ps_url, xbox_url = await fetch_game_store_info(session, result["id"])
 
     release_ts = result.get("first_release_date")
-    upsert_game(result["id"], result["name"], release_ts, manual=True, image_url=image_url, steam_app_id=steam_app_id, platforms=platforms)
+    upsert_game(result["id"], result["name"], release_ts, manual=True, image_url=image_url, steam_app_id=steam_app_id, platforms=platforms, ps_url=ps_url, xbox_url=xbox_url)
 
     now_ts = datetime.now(timezone.utc).timestamp()
     if release_ts and release_ts <= now_ts:
@@ -501,21 +544,26 @@ async def slash_unwatch(interaction: discord.Interaction, game: str):
 
 @tree.command(name="watchlist", description="Show all currently watched games (private — only you can see it)")
 async def slash_watchlist(interaction: discord.Interaction):
-    embed = _build_watchlist_embed()
-    if not embed:
+    embeds = _build_watchlist_embeds()
+    if not embeds:
         await interaction.response.send_message("No games on the watch list yet.", ephemeral=True)
         return
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    for embed in embeds:
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @tree.command(name="postwatchlist", description="Post the game watch list publicly in this channel")
 async def slash_postwatchlist(interaction: discord.Interaction):
-    embed = _build_watchlist_embed()
-    if not embed:
+    embeds = _build_watchlist_embeds()
+    if not embeds:
         await interaction.response.send_message("No games on the watch list yet.", ephemeral=True)
         return
     await interaction.response.defer()
-    await interaction.channel.send(embed=embed)
+    first, *rest = embeds
+    await interaction.followup.send(embed=first)
+    for embed in rest:
+        await interaction.channel.send(embed=embed)
 
 
 @tree.command(name="testannounce", description="Preview what a launch announcement looks like")
@@ -621,7 +669,8 @@ async def before_weekly_watchlist():
     await asyncio.sleep(wait_seconds)
 
 
-def _build_watchlist_embed() -> discord.Embed | None:
+def _build_watchlist_embeds() -> list[discord.Embed]:
+    """Watchlist as one or more embeds (links can push past the 4096-char limit)."""
     igdb_games = get_watchlist()
     steam_games = get_steam_watchlist()
 
@@ -635,16 +684,26 @@ def _build_watchlist_embed() -> discord.Embed | None:
         return f"{prefix} {discord.utils.format_dt(dt, 'D')}"
 
     def store_url(g: dict) -> str | None:
+        """Best link for the game name: Steam, else PlayStation, else Xbox."""
         if g.get("steam_app_id"):
             return f"https://store.steampowered.com/app/{g['steam_app_id']}/"
         if g.get("steam_id"):
             return f"https://store.steampowered.com/app/{g['steam_id']}/"
-        return None
+        return g.get("ps_url") or g.get("xbox_url")
 
     def platform_badges(g: dict) -> str:
         raw = g.get("platforms") or ""
-        badges = [b for b in raw.split(",") if b]
-        return (" · " + " · ".join(badges)) if badges else ""
+        parts = []
+        for b in raw.split(","):
+            if not b:
+                continue
+            if b in ("PS4", "PS5") and g.get("ps_url"):
+                parts.append(f"[{b}]({g['ps_url']})")
+            elif b in ("XB1", "XSX") and g.get("xbox_url"):
+                parts.append(f"[{b}]({g['xbox_url']})")
+            else:
+                parts.append(b)
+        return (" · " + " · ".join(parts)) if parts else ""
 
     def format_entry(g: dict, tag: str) -> str:
         url = store_url(g)
@@ -662,21 +721,32 @@ def _build_watchlist_embed() -> discord.Embed | None:
     all_games.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
 
     if not all_games:
-        return None
+        return []
 
     lines = [format_entry(g, g["tag"]) for g in all_games]
-    embed = discord.Embed(
-        title="Game Watch List",
-        description="\n".join(lines),
-        color=discord.Color.blurple(),
-    )
-    embed.set_footer(text="🔥 = IGDB high-profile  |  📌 = manually added  |  🎮 = Steam wishlisted")
-    return embed
+    chunks: list[list[str]] = [[]]
+    length = 0
+    for line in lines:
+        if length + len(line) + 1 > 3800 and chunks[-1]:
+            chunks.append([])
+            length = 0
+        chunks[-1].append(line)
+        length += len(line) + 1
+
+    embeds = []
+    for i, chunk in enumerate(chunks):
+        title = "Game Watch List" if len(chunks) == 1 else f"Game Watch List ({i + 1}/{len(chunks)})"
+        embeds.append(discord.Embed(
+            title=title,
+            description="\n".join(chunk),
+            color=discord.Color.blurple(),
+        ))
+    embeds[-1].set_footer(text="🔥 = IGDB high-profile  |  📌 = manually added  |  🎮 = Steam wishlisted")
+    return embeds
 
 
 async def _post_watchlist(channel: discord.TextChannel):
-    embed = _build_watchlist_embed()
-    if embed:
+    for embed in _build_watchlist_embeds():
         await channel.send(embed=embed)
 
 
@@ -686,7 +756,7 @@ def _build_site_payload() -> dict:
     con = sqlite3.connect(DB_PATH)
 
     igdb_rows = con.execute(
-        "SELECT name, release_ts, manual, image_url, steam_app_id, platforms FROM watched_games "
+        "SELECT name, release_ts, manual, image_url, steam_app_id, platforms, ps_url, xbox_url FROM watched_games "
         "WHERE announced=0 AND (release_ts IS NULL OR release_ts > ?) ORDER BY release_ts",
         (now_ts,),
     ).fetchall()
@@ -698,13 +768,15 @@ def _build_site_payload() -> dict:
 
     upcoming = [
         {"name": r[0], "release_ts": r[1], "tag": "manual" if r[2] else "igdb",
-         "image_url": r[3], "steam_app_id": r[4], "platforms": r[5]}
+         "image_url": r[3], "steam_app_id": r[4], "platforms": r[5],
+         "ps_url": r[6], "xbox_url": r[7]}
         for r in igdb_rows
     ]
     seen = {g["name"].lower() for g in upcoming}
     upcoming += [
         {"name": r[0], "release_ts": r[1], "tag": "steam",
-         "image_url": r[2], "steam_app_id": r[3], "platforms": None}
+         "image_url": r[2], "steam_app_id": r[3], "platforms": None,
+         "ps_url": None, "xbox_url": None}
         for r in steam_rows if r[0].lower() not in seen
     ]
     upcoming.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
@@ -757,8 +829,8 @@ async def _sync_high_profile() -> int:
             store_info = await fetch_store_info_batch(session, [g["id"] for g in valid])
             for g in valid:
                 image_url = await fetch_cover_url(session, g["id"])
-                steam_app_id, platforms = store_info.get(g["id"], (None, None))
-                upsert_game(g["id"], g["name"], g.get("first_release_date"), manual=False, image_url=image_url, source="igdb", steam_app_id=steam_app_id, platforms=platforms)
+                steam_app_id, platforms, ps_url, xbox_url = store_info.get(g["id"], (None, None, None, None))
+                upsert_game(g["id"], g["name"], g.get("first_release_date"), manual=False, image_url=image_url, source="igdb", steam_app_id=steam_app_id, platforms=platforms, ps_url=ps_url, xbox_url=xbox_url)
             log.info("Synced %d IGDB games", len(valid))
             total += len(valid)
         else:
@@ -774,17 +846,19 @@ async def _sync_high_profile() -> int:
         # or games synced while the external_games query was broken)
         con = sqlite3.connect(DB_PATH)
         missing = [r[0] for r in con.execute(
-            "SELECT igdb_id FROM watched_games WHERE announced=0 AND steam_app_id IS NULL"
+            "SELECT igdb_id FROM watched_games WHERE announced=0 AND "
+            "(steam_app_id IS NULL OR ps_url IS NULL OR xbox_url IS NULL)"
         ).fetchall()]
         con.close()
         if missing:
             info = await fetch_store_info_batch(session, missing)
             con = sqlite3.connect(DB_PATH)
-            for gid, (app_id, platforms) in info.items():
+            for gid, (app_id, platforms, ps_url, xbox_url) in info.items():
                 con.execute(
                     "UPDATE watched_games SET steam_app_id=COALESCE(?, steam_app_id), "
-                    "platforms=COALESCE(?, platforms) WHERE igdb_id=?",
-                    (app_id, platforms, gid),
+                    "platforms=COALESCE(?, platforms), ps_url=COALESCE(?, ps_url), "
+                    "xbox_url=COALESCE(?, xbox_url) WHERE igdb_id=?",
+                    (app_id, platforms, ps_url, xbox_url, gid),
                 )
             con.commit()
             con.close()
