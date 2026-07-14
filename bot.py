@@ -268,19 +268,34 @@ PLATFORM_LABELS = {
 }
 
 
+async def fetch_store_info_batch(session: aiohttp.ClientSession, igdb_ids: list[int]) -> dict[int, tuple[str | None, str | None]]:
+    """Batch fetch (steam_app_id, platforms_str) for multiple games in 2 API calls."""
+    if not igdb_ids:
+        return {}
+    id_list = ",".join(str(i) for i in igdb_ids)
+
+    # Single call for all Steam app IDs
+    ext_rows = await igdb_query(session, "external_games", f"fields game,uid; where game=({id_list}) & category=1; limit 500;")
+    steam_map = {r["game"]: str(r["uid"]) for r in ext_rows if "game" in r and "uid" in r}
+
+    # Single call for all platform lists (already have them from the games query but re-fetch to be safe)
+    plat_rows = await igdb_query(session, "games", f"fields id,platforms; where id=({id_list}); limit 500;")
+    plat_map = {r["id"]: r.get("platforms", []) for r in plat_rows if "id" in r}
+
+    result = {}
+    for igdb_id in igdb_ids:
+        steam_app_id = steam_map.get(igdb_id)
+        platform_ids = plat_map.get(igdb_id, [])
+        badges = [PLATFORM_LABELS[p] for p in platform_ids if p in PLATFORM_LABELS and PLATFORM_LABELS[p]]
+        platforms_str = ",".join(sorted(set(badges))) if badges else None
+        result[igdb_id] = (steam_app_id, platforms_str)
+    return result
+
+
 async def fetch_game_store_info(session: aiohttp.ClientSession, igdb_id: int) -> tuple[str | None, str | None]:
-    """Return (steam_app_id, platforms_str) for a game. platforms_str is comma-separated badges."""
-    # Get Steam app ID from external_games (category 1 = Steam)
-    ext = await igdb_query(session, "external_games", f"fields uid; where game={igdb_id} & category=1; limit 1;")
-    steam_app_id = ext[0]["uid"] if ext and "uid" in ext[0] else None
-
-    # Get platform IDs
-    plat_data = await igdb_query(session, "games", f"fields platforms; where id={igdb_id};")
-    platform_ids = plat_data[0].get("platforms", []) if plat_data else []
-    badges = [PLATFORM_LABELS[p] for p in platform_ids if p in PLATFORM_LABELS and PLATFORM_LABELS[p]]
-    platforms_str = ",".join(sorted(set(badges))) if badges else None
-
-    return steam_app_id, platforms_str
+    """Return (steam_app_id, platforms_str) for a single game."""
+    results = await fetch_store_info_batch(session, [igdb_id])
+    return results.get(igdb_id, (None, None))
 
 
 async def search_game(session: aiohttp.ClientSession, name: str) -> list[dict]:
@@ -640,9 +655,10 @@ async def _sync_high_profile() -> int:
         games = await fetch_high_profile_upcoming(session)
         if isinstance(games, list):
             valid = [g for g in games if "id" in g and "name" in g]
+            store_info = await fetch_store_info_batch(session, [g["id"] for g in valid])
             for g in valid:
                 image_url = await fetch_cover_url(session, g["id"])
-                steam_app_id, platforms = await fetch_game_store_info(session, g["id"])
+                steam_app_id, platforms = store_info.get(g["id"], (None, None))
                 upsert_game(g["id"], g["name"], g.get("first_release_date"), manual=False, image_url=image_url, source="igdb", steam_app_id=steam_app_id, platforms=platforms)
             log.info("Synced %d IGDB games", len(valid))
             total += len(valid)
