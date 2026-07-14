@@ -155,11 +155,14 @@ def get_unannounced_launching_today() -> list[dict]:
     end = start + 86400
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        "SELECT igdb_id, name, release_ts, image_url FROM watched_games WHERE announced=0 AND release_ts>=? AND release_ts<?",
+        "SELECT igdb_id, name, release_ts, image_url, steam_app_id, ps_url, xbox_url, nsw_url, web_url "
+        "FROM watched_games WHERE announced=0 AND release_ts>=? AND release_ts<?",
         (start, end)
     ).fetchall()
     con.close()
-    return [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3]} for r in rows]
+    return [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3],
+             "steam_app_id": r[4], "ps_url": r[5], "xbox_url": r[6], "nsw_url": r[7],
+             "web_url": r[8]} for r in rows]
 
 
 def get_overdue_unannounced() -> list[dict]:
@@ -167,7 +170,8 @@ def get_overdue_unannounced() -> list[dict]:
     now = int(datetime.now(timezone.utc).timestamp())
     con = sqlite3.connect(DB_PATH)
     igdb_rows = con.execute(
-        "SELECT igdb_id, name, release_ts, image_url FROM watched_games WHERE announced=0 AND release_ts<?",
+        "SELECT igdb_id, name, release_ts, image_url, steam_app_id, ps_url, xbox_url, nsw_url, web_url "
+        "FROM watched_games WHERE announced=0 AND release_ts<?",
         (now,)
     ).fetchall()
     steam_rows = con.execute(
@@ -175,7 +179,9 @@ def get_overdue_unannounced() -> list[dict]:
         (now,)
     ).fetchall()
     con.close()
-    result = [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3]} for r in igdb_rows]
+    result = [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3],
+               "steam_app_id": r[4], "ps_url": r[5], "xbox_url": r[6], "nsw_url": r[7],
+               "web_url": r[8]} for r in igdb_rows]
     result += [{"steam_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3]} for r in steam_rows]
     return result
 
@@ -631,6 +637,10 @@ async def slash_watch(interaction: discord.Interaction, game: str):
         )
         release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
         embed.add_field(name="Release Date", value=discord.utils.format_dt(release_dt, "D"))
+        links = _store_links_line({"steam_app_id": steam_app_id, "ps_url": ps_url,
+                                   "xbox_url": xbox_url, "nsw_url": nsw_url, "web_url": web_url})
+        if links:
+            embed.add_field(name="Get it", value=links, inline=False)
         if image_url:
             embed.set_image(url=image_url)
         for (channel_id,) in channels:
@@ -806,8 +816,8 @@ def _build_watchlist_embeds() -> list[discord.Embed]:
             return "TBA"
         dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
         if 0 < release_ts - now_ts < 86400:
-            # live countdown for launches less than a day out
-            return f"releases {discord.utils.format_dt(dt, 'R')}"
+            # exact unlock hour isn't in the databases, so don't pretend
+            return "**Less than 24hrs!**"
         prefix = "released" if release_ts < now_ts else "releases"
         # plain UTC calendar date — matches the store listing instead of
         # shifting a day for viewers behind UTC
@@ -915,17 +925,22 @@ def _build_site_payload() -> dict:
 
     featured = None
     candidates = con.execute(
-        "SELECT name, release_ts, image_url, COALESCE(announced_at, release_ts) AS at "
+        "SELECT name, release_ts, image_url, COALESCE(announced_at, release_ts) AS at, "
+        "       steam_app_id, ps_url, xbox_url, nsw_url, web_url "
         "FROM watched_games WHERE announced=1 "
         "UNION ALL "
-        "SELECT name, release_ts, image_url, COALESCE(announced_at, release_ts) AS at "
+        "SELECT name, release_ts, image_url, COALESCE(announced_at, release_ts) AS at, "
+        "       steam_id, NULL, NULL, NULL, NULL "
         "FROM steam_games WHERE announced=1 "
         "ORDER BY at DESC LIMIT 1"
     ).fetchone()
     con.close()
     if candidates:
         featured = {"name": candidates[0], "release_ts": candidates[1],
-                    "image_url": candidates[2], "announced_at": candidates[3]}
+                    "image_url": candidates[2], "announced_at": candidates[3],
+                    "steam_app_id": candidates[4], "ps_url": candidates[5],
+                    "xbox_url": candidates[6], "nsw_url": candidates[7],
+                    "web_url": candidates[8]}
 
     return {"featured": featured, "upcoming": upcoming}
 
@@ -1003,6 +1018,23 @@ async def _sync_high_profile() -> int:
     return total
 
 
+def _store_links_line(game: dict) -> str | None:
+    """'Get it' links for an announcement: every store the game is on."""
+    links = []
+    appid = game.get("steam_app_id") or game.get("steam_id")
+    if appid:
+        links.append(f"[Steam](https://store.steampowered.com/app/{appid}/)")
+    if game.get("ps_url"):
+        links.append(f"[PlayStation]({game['ps_url']})")
+    if game.get("xbox_url"):
+        links.append(f"[Xbox]({game['xbox_url']})")
+    if game.get("nsw_url"):
+        links.append(f"[Nintendo]({game['nsw_url']})")
+    if not links and game.get("web_url"):
+        links.append(f"[Website]({game['web_url']})")
+    return " · ".join(links) if links else None
+
+
 async def _announce_launches(include_overdue: bool = False):
     igdb_launching = get_unannounced_launching_today()
     igdb_names = {g["name"].lower() for g in igdb_launching}
@@ -1029,6 +1061,9 @@ async def _announce_launches(include_overdue: bool = False):
         if game["release_ts"]:
             dt = datetime.fromtimestamp(game["release_ts"], tz=timezone.utc)
             embed.add_field(name="Release Date", value=discord.utils.format_dt(dt, "D"))
+        links = _store_links_line(game)
+        if links:
+            embed.add_field(name="Get it", value=links, inline=False)
         if game.get("image_url"):
             embed.set_image(url=game["image_url"])
 
