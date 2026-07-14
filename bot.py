@@ -57,6 +57,10 @@ def init_db():
         con.execute("ALTER TABLE watched_games ADD COLUMN image_url TEXT")
     if "source" not in cols:
         con.execute("ALTER TABLE watched_games ADD COLUMN source TEXT DEFAULT 'igdb'")
+    if "steam_app_id" not in cols:
+        con.execute("ALTER TABLE watched_games ADD COLUMN steam_app_id TEXT")
+    if "platforms" not in cols:
+        con.execute("ALTER TABLE watched_games ADD COLUMN platforms TEXT")
     con.execute("""
         CREATE TABLE IF NOT EXISTS config (
             guild_id    TEXT PRIMARY KEY,
@@ -81,11 +85,11 @@ def set_channel(guild_id: int, channel_id: int):
     con.close()
 
 
-def upsert_game(igdb_id: int, name: str, release_ts: int | None, manual: bool = False, image_url: str | None = None, source: str = "igdb"):
+def upsert_game(igdb_id: int, name: str, release_ts: int | None, manual: bool = False, image_url: str | None = None, source: str = "igdb", steam_app_id: str | None = None, platforms: str | None = None):
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-        INSERT INTO watched_games (igdb_id, name, release_ts, manual, image_url, source)
-        VALUES (?,?,?,?,?,?)
+        INSERT INTO watched_games (igdb_id, name, release_ts, manual, image_url, source, steam_app_id, platforms)
+        VALUES (?,?,?,?,?,?,?,?)
         ON CONFLICT(igdb_id) DO UPDATE SET
             name=excluded.name,
             release_ts=excluded.release_ts,
@@ -93,8 +97,10 @@ def upsert_game(igdb_id: int, name: str, release_ts: int | None, manual: bool = 
             image_url=COALESCE(excluded.image_url, image_url),
             source=CASE WHEN excluded.source != 'igdb' AND source = 'igdb' THEN 'both'
                         WHEN excluded.source = 'igdb' AND source != 'igdb' THEN 'both'
-                        ELSE source END
-    """, (igdb_id, name, release_ts, int(manual), image_url, source))
+                        ELSE source END,
+            steam_app_id=COALESCE(excluded.steam_app_id, steam_app_id),
+            platforms=COALESCE(excluded.platforms, platforms)
+    """, (igdb_id, name, release_ts, int(manual), image_url, source, steam_app_id, platforms))
     con.commit()
     con.close()
 
@@ -110,12 +116,12 @@ def get_watchlist() -> list[dict]:
     now = int(datetime.now(timezone.utc).timestamp())
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        "SELECT igdb_id, name, release_ts, manual FROM watched_games "
+        "SELECT igdb_id, name, release_ts, manual, steam_app_id, platforms FROM watched_games "
         "WHERE announced=0 AND (release_ts IS NULL OR release_ts > ?) ORDER BY release_ts",
         (now,)
     ).fetchall()
     con.close()
-    return [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "manual": bool(r[3])} for r in rows]
+    return [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "manual": bool(r[3]), "steam_app_id": r[4], "platforms": r[5]} for r in rows]
 
 
 def get_unannounced_launching_today() -> list[dict]:
@@ -251,6 +257,32 @@ async def fetch_cover_url(session: aiohttp.ClientSession, game_id: int) -> str |
     return None
 
 
+PLATFORM_LABELS = {
+    6: None,      # PC — no badge needed, Steam link covers it
+    14: None,     # Mac
+    48: "PS4",
+    167: "PS5",
+    49: "XB1",
+    169: "XSX",
+    130: "NSW",
+}
+
+
+async def fetch_game_store_info(session: aiohttp.ClientSession, igdb_id: int) -> tuple[str | None, str | None]:
+    """Return (steam_app_id, platforms_str) for a game. platforms_str is comma-separated badges."""
+    # Get Steam app ID from external_games (category 1 = Steam)
+    ext = await igdb_query(session, "external_games", f"fields uid; where game={igdb_id} & category=1; limit 1;")
+    steam_app_id = ext[0]["uid"] if ext and "uid" in ext[0] else None
+
+    # Get platform IDs
+    plat_data = await igdb_query(session, "games", f"fields platforms; where id={igdb_id};")
+    platform_ids = plat_data[0].get("platforms", []) if plat_data else []
+    badges = [PLATFORM_LABELS[p] for p in platform_ids if p in PLATFORM_LABELS and PLATFORM_LABELS[p]]
+    platforms_str = ",".join(sorted(set(badges))) if badges else None
+
+    return steam_app_id, platforms_str
+
+
 async def search_game(session: aiohttp.ClientSession, name: str) -> list[dict]:
     """Return top matches for a game name."""
     body = f'search "{name}"; fields id,name,hypes,first_release_date; limit 5;'
@@ -383,9 +415,10 @@ async def slash_watch(interaction: discord.Interaction, game: str):
             return
         result = results[0]
         image_url = await fetch_cover_url(session, result["id"])
+        steam_app_id, platforms = await fetch_game_store_info(session, result["id"])
 
     release_ts = result.get("first_release_date")
-    upsert_game(result["id"], result["name"], release_ts, manual=True, image_url=image_url)
+    upsert_game(result["id"], result["name"], release_ts, manual=True, image_url=image_url, steam_app_id=steam_app_id, platforms=platforms)
 
     now_ts = datetime.now(timezone.utc).timestamp()
     if release_ts and release_ts <= now_ts:
@@ -560,20 +593,37 @@ async def _post_watchlist(channel: discord.TextChannel):
         prefix = "released" if release_ts < now_ts else "releases"
         return f"{prefix} {discord.utils.format_dt(dt, 'D')}"
 
+    def store_url(g: dict) -> str | None:
+        if g.get("steam_app_id"):
+            return f"https://store.steampowered.com/app/{g['steam_app_id']}/"
+        if g.get("steam_id"):
+            return f"https://store.steampowered.com/app/{g['steam_id']}/"
+        return None
+
+    def platform_badges(g: dict) -> str:
+        raw = g.get("platforms") or ""
+        badges = [b for b in raw.split(",") if b]
+        return (" · " + " · ".join(badges)) if badges else ""
+
+    def format_entry(g: dict, tag: str) -> str:
+        url = store_url(g)
+        name = f"[{g['name']}]({url})" if url else f"**{g['name']}**"
+        return f"{tag} {name}{platform_badges(g)} — {date_str(g['release_ts'])}"
+
     igdb_names = {g["name"].lower() for g in igdb_games}
     all_games = []
     for g in igdb_games:
-        all_games.append({"name": g["name"], "release_ts": g["release_ts"], "tag": "📌" if g["manual"] else "🔥"})
+        all_games.append({**g, "tag": "📌" if g["manual"] else "🔥"})
     for g in steam_games:
         if g["name"].lower() not in igdb_names:
-            all_games.append({"name": g["name"], "release_ts": g["release_ts"], "tag": "🎮"})
+            all_games.append({**g, "tag": "🎮"})
 
     all_games.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
 
     if not all_games:
         return
 
-    lines = [f"{g['tag']} **{g['name']}** — {date_str(g['release_ts'])}" for g in all_games]
+    lines = [format_entry(g, g["tag"]) for g in all_games]
     embed = discord.Embed(
         title="Game Watch List",
         description="\n".join(lines),
@@ -592,7 +642,8 @@ async def _sync_high_profile() -> int:
             valid = [g for g in games if "id" in g and "name" in g]
             for g in valid:
                 image_url = await fetch_cover_url(session, g["id"])
-                upsert_game(g["id"], g["name"], g.get("first_release_date"), manual=False, image_url=image_url, source="igdb")
+                steam_app_id, platforms = await fetch_game_store_info(session, g["id"])
+                upsert_game(g["id"], g["name"], g.get("first_release_date"), manual=False, image_url=image_url, source="igdb", steam_app_id=steam_app_id, platforms=platforms)
             log.info("Synced %d IGDB games", len(valid))
             total += len(valid)
         else:
