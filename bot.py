@@ -402,7 +402,8 @@ async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="GameAnnouncer Commands", color=discord.Color.blurple())
     embed.add_field(name="/watch", value="Add a game to the watch list by name.", inline=False)
     embed.add_field(name="/unwatch", value="Remove a game from the watch list.", inline=False)
-    embed.add_field(name="/watchlist", value="Show all watched games with their release dates.", inline=False)
+    embed.add_field(name="/watchlist", value="Show all watched games privately (only you see it).", inline=False)
+    embed.add_field(name="/postwatchlist", value="Post the watch list publicly in the channel.", inline=False)
     embed.add_field(name="/setchannel", value="Set the channel where announcements are posted. *(Requires Manage Channels)*", inline=False)
     embed.add_field(name="/syncgames", value="Manually pull the latest high-profile games from IGDB + Steam. *(Requires Manage Server)*", inline=False)
     embed.add_field(name="/testannounce", value="Preview what a launch announcement looks like. *(Requires Manage Server)*", inline=False)
@@ -485,15 +486,23 @@ async def slash_unwatch(interaction: discord.Interaction, game: str):
     await interaction.response.send_message(f"Removed {names} from the watch list.", ephemeral=True)
 
 
-@tree.command(name="watchlist", description="Show all currently watched games")
+@tree.command(name="watchlist", description="Show all currently watched games (private — only you can see it)")
 async def slash_watchlist(interaction: discord.Interaction):
-    igdb_games = get_watchlist()
-    steam_games = get_steam_watchlist()
-    if not igdb_games and not steam_games:
+    embed = _build_watchlist_embed()
+    if not embed:
+        await interaction.response.send_message("No games on the watch list yet.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="postwatchlist", description="Post the game watch list publicly in this channel")
+async def slash_postwatchlist(interaction: discord.Interaction):
+    embed = _build_watchlist_embed()
+    if not embed:
         await interaction.response.send_message("No games on the watch list yet.", ephemeral=True)
         return
     await interaction.response.defer()
-    await _post_watchlist(interaction.channel)
+    await interaction.channel.send(embed=embed)
 
 
 @tree.command(name="testannounce", description="Preview what a launch announcement looks like")
@@ -595,7 +604,7 @@ async def before_weekly_watchlist():
     await asyncio.sleep(wait_seconds)
 
 
-async def _post_watchlist(channel: discord.TextChannel):
+def _build_watchlist_embed() -> discord.Embed | None:
     igdb_games = get_watchlist()
     steam_games = get_steam_watchlist()
 
@@ -636,7 +645,7 @@ async def _post_watchlist(channel: discord.TextChannel):
     all_games.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
 
     if not all_games:
-        return
+        return None
 
     lines = [format_entry(g, g["tag"]) for g in all_games]
     embed = discord.Embed(
@@ -645,7 +654,13 @@ async def _post_watchlist(channel: discord.TextChannel):
         color=discord.Color.blurple(),
     )
     embed.set_footer(text="🔥 = IGDB high-profile  |  📌 = manually added  |  🎮 = Steam wishlisted")
-    await channel.send(embed=embed)
+    return embed
+
+
+async def _post_watchlist(channel: discord.TextChannel):
+    embed = _build_watchlist_embed()
+    if embed:
+        await channel.send(embed=embed)
 
 
 async def _sync_high_profile() -> int:
