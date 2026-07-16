@@ -166,17 +166,22 @@ def get_unannounced_launching_today() -> list[dict]:
 
 
 def get_overdue_unannounced() -> list[dict]:
-    """Games that have already released but were never announced."""
+    """Games that released within the last week but were never announced.
+
+    The window keeps old titles (e.g. back-catalog games that slip in via
+    syncs) from being announced as if they just launched.
+    """
     now = int(datetime.now(timezone.utc).timestamp())
+    cutoff = now - 7 * 86400
     con = sqlite3.connect(DB_PATH)
     igdb_rows = con.execute(
         "SELECT igdb_id, name, release_ts, image_url, steam_app_id, ps_url, xbox_url, nsw_url, web_url "
-        "FROM watched_games WHERE announced=0 AND release_ts<?",
-        (now,)
+        "FROM watched_games WHERE announced=0 AND release_ts<? AND release_ts>=?",
+        (now, cutoff)
     ).fetchall()
     steam_rows = con.execute(
-        "SELECT steam_id, name, release_ts, image_url FROM steam_games WHERE announced=0 AND release_ts<?",
-        (now,)
+        "SELECT steam_id, name, release_ts, image_url FROM steam_games WHERE announced=0 AND release_ts<? AND release_ts>=?",
+        (now, cutoff)
     ).fetchall()
     con.close()
     result = [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3],
@@ -907,15 +912,19 @@ def _build_site_payload() -> dict:
     upcoming.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
 
     featured = None
+    # only feature genuinely recent launches (not back-catalog games that
+    # slipped through a sync with an old release date)
+    fresh = now_ts - 30 * 86400
     candidates = con.execute(
         "SELECT name, release_ts, image_url, COALESCE(announced_at, release_ts) AS at, "
         "       steam_app_id, ps_url, xbox_url, nsw_url, web_url "
-        "FROM watched_games WHERE announced=1 "
+        "FROM watched_games WHERE announced=1 AND release_ts>=? "
         "UNION ALL "
         "SELECT name, release_ts, image_url, COALESCE(announced_at, release_ts) AS at, "
         "       steam_id, NULL, NULL, NULL, NULL "
-        "FROM steam_games WHERE announced=1 "
-        "ORDER BY at DESC LIMIT 1"
+        "FROM steam_games WHERE announced=1 AND release_ts>=? "
+        "ORDER BY at DESC LIMIT 1",
+        (fresh, fresh)
     ).fetchone()
     con.close()
     if candidates:
