@@ -585,7 +585,7 @@ async def on_ready():
 @tree.command(name="help", description="List all GameAnnouncer commands")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="GameAnnouncer Commands", color=discord.Color.blurple())
-    embed.add_field(name="/watch", value="Add a game to the watch list by name.", inline=False)
+    embed.add_field(name="/watch", value="Add an upcoming game to the watch list by name (already-released games can't be added).", inline=False)
     embed.add_field(name="/unwatch", value="Remove a game from the watch list.", inline=False)
     embed.add_field(name="/watchlist", value="Show all watched games privately (only you see it).", inline=False)
     embed.add_field(name="/postwatchlist", value="Post the watch list publicly in the channel.", inline=False)
@@ -605,7 +605,7 @@ async def slash_setchannel(interaction: discord.Interaction, channel: discord.Te
     await interaction.response.send_message(f"Announcements will be posted in {target.mention}.", ephemeral=True)
 
 
-@tree.command(name="watch", description="Add a game to the watch list")
+@tree.command(name="watch", description="Add an upcoming game to the watch list")
 @app_commands.describe(game="Name of the game to watch")
 async def slash_watch(interaction: discord.Interaction, game: str):
     await interaction.response.defer(ephemeral=True)
@@ -615,40 +615,23 @@ async def slash_watch(interaction: discord.Interaction, game: str):
             await interaction.followup.send(f"No games found matching **{game}**.")
             return
         result = results[0]
+
+        release_ts = result.get("first_release_date")
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if release_ts and release_ts <= now_ts:
+            release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
+            await interaction.followup.send(
+                f"**{result['name']}** already launched ({release_dt.strftime('%b %d, %Y')}) — "
+                "only upcoming games can be added to the watch list."
+            )
+            return
+
         image_url = await fetch_cover_url(session, result["id"])
         steam_app_id, platforms, ps_url, xbox_url, nsw_url, web_url = await fetch_game_store_info(session, result["id"])
 
-    release_ts = result.get("first_release_date")
     upsert_game(result["id"], result["name"], release_ts, manual=True, image_url=image_url, steam_app_id=steam_app_id, platforms=platforms, ps_url=ps_url, xbox_url=xbox_url, nsw_url=nsw_url, web_url=web_url)
 
-    now_ts = datetime.now(timezone.utc).timestamp()
-    if release_ts and release_ts <= now_ts:
-        # Game already launched — announce it immediately
-        await interaction.followup.send(
-            f"**{result['name']}** has already launched! Posting announcement now..."
-        )
-        con = sqlite3.connect(DB_PATH)
-        channels = con.execute("SELECT channel_id FROM config").fetchall()
-        con.close()
-        embed = discord.Embed(
-            title="🎮 Game Launch Today!",
-            description=f"**{result['name']}** is out now!",
-            color=discord.Color.green(),
-        )
-        release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
-        embed.add_field(name="Release Date", value=discord.utils.format_dt(release_dt, "D"))
-        links = _store_links_line({"steam_app_id": steam_app_id, "ps_url": ps_url,
-                                   "xbox_url": xbox_url, "nsw_url": nsw_url, "web_url": web_url})
-        if links:
-            embed.add_field(name="Get it", value=links, inline=False)
-        if image_url:
-            embed.set_image(url=image_url)
-        for (channel_id,) in channels:
-            channel = bot.get_channel(int(channel_id))
-            if channel:
-                await channel.send(embed=embed)
-        mark_announced(result["id"])
-    elif release_ts:
+    if release_ts:
         release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
         await interaction.followup.send(
             f"Now watching **{result['name']}** — releases {discord.utils.format_dt(release_dt, 'D')}."

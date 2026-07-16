@@ -14,7 +14,7 @@ A Discord bot that tracks upcoming game releases and announces them on launch da
 
 | Command | Description | Permission |
 |---|---|---|
-| `/watch <game>` | Add a game to the watch list by name | Everyone |
+| `/watch <game>` | Add an upcoming game to the watch list by name (already-released games are rejected) | Everyone |
 | `/unwatch <game>` | Remove a game from the watch list | Everyone |
 | `/watchlist` | Show all watched games sorted by release date | Everyone |
 | `/setchannel [#channel]` | Set the channel for announcements | Manage Channels |
