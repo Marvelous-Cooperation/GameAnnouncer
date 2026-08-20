@@ -488,6 +488,36 @@ async def fetch_game_store_info(session: aiohttp.ClientSession, igdb_id: int) ->
     return results.get(igdb_id, (None, None, None, None, None, None))
 
 
+async def fetch_steam_unlock_time(session: aiohttp.ClientSession, steam_app_id: str) -> int | None:
+    """Scrape the Steam store page for an exact unlock timestamp.
+
+    Only returns a value when Steam is showing a countdown (typically 1-7 days
+    before launch). Returns None when the time isn't published yet.
+    """
+    url = f"https://store.steampowered.com/app/{steam_app_id}/"
+    cookies = {"birthtime": "0", "lastagecheckage": "1-0-1990", "wants_mature_content": "1"}
+    try:
+        async with session.get(url, headers=_BROWSER_UA, cookies=cookies,
+                               timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text()
+    except Exception as e:
+        log.debug("Steam unlock scrape failed for app %s: %s", steam_app_id, e)
+        return None
+
+    # Steam embeds the unlock Unix timestamp as data-timestamp on countdown elements
+    m = re.search(r'data-timestamp=["\'](\d{9,11})["\']', html)
+    if not m:
+        return None
+    ts = int(m.group(1))
+    now = datetime.now(timezone.utc).timestamp()
+    # Sanity-check: must be a future time within 48 hours
+    if now < ts < now + 48 * 3600:
+        return ts
+    return None
+
+
 async def search_game(session: aiohttp.ClientSession, name: str) -> list[dict]:
     """Return top matches for a game name."""
     body = f'search "{name}"; fields id,name,hypes,first_release_date; limit 5;'
@@ -580,6 +610,8 @@ async def on_ready():
     log.info("Slash commands synced")
     daily_check.start()
     weekly_watchlist.start()
+    refresh_unlock_times.start()
+    launch_monitor.start()
     asyncio.create_task(_startup_check())
 
 
@@ -757,6 +789,67 @@ async def _startup_check():
     await _announce_launches(include_overdue=True)
     await push_watchlist_to_website()
     log.info("Startup check complete")
+
+
+@tasks.loop(hours=1)
+async def refresh_unlock_times():
+    """Scrape Steam for precise unlock timestamps for games launching within 48 hours."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    window_end = now_ts + 48 * 3600
+
+    con = sqlite3.connect(DB_PATH)
+    igdb_candidates = con.execute(
+        "SELECT igdb_id, name, steam_app_id, release_ts FROM watched_games "
+        "WHERE announced=0 AND steam_app_id IS NOT NULL AND (release_ts IS NULL OR release_ts <= ?)",
+        (window_end,)
+    ).fetchall()
+    steam_candidates = con.execute(
+        "SELECT steam_id, name, release_ts FROM steam_games "
+        "WHERE announced=0 AND (release_ts IS NULL OR release_ts <= ?)",
+        (window_end,)
+    ).fetchall()
+    con.close()
+
+    if not igdb_candidates and not steam_candidates:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        for igdb_id, name, steam_app_id, current_ts in igdb_candidates:
+            unlock_ts = await fetch_steam_unlock_time(session, steam_app_id)
+            if unlock_ts and unlock_ts != current_ts:
+                con = sqlite3.connect(DB_PATH)
+                con.execute("UPDATE watched_games SET release_ts=? WHERE igdb_id=?", (unlock_ts, igdb_id))
+                con.commit()
+                con.close()
+                log.info("Refined unlock time for %s → %s UTC", name,
+                         datetime.fromtimestamp(unlock_ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M'))
+
+        for steam_id, name, current_ts in steam_candidates:
+            unlock_ts = await fetch_steam_unlock_time(session, steam_id)
+            if unlock_ts and unlock_ts != current_ts:
+                con = sqlite3.connect(DB_PATH)
+                con.execute("UPDATE steam_games SET release_ts=? WHERE steam_id=?", (unlock_ts, steam_id))
+                con.commit()
+                con.close()
+                log.info("Refined unlock time for %s → %s UTC", name,
+                         datetime.fromtimestamp(unlock_ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M'))
+
+
+@refresh_unlock_times.before_loop
+async def before_refresh_unlock_times():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=30)
+async def launch_monitor():
+    """Announce any game whose precise unlock time just passed."""
+    await _announce_launches(include_overdue=True)
+    await push_watchlist_to_website()
+
+
+@launch_monitor.before_loop
+async def before_launch_monitor():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(hours=168)  # weekly
