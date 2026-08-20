@@ -741,8 +741,11 @@ async def daily_check():
 async def before_daily_check():
     await bot.wait_until_ready()
     now = datetime.now(timezone.utc)
-    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    wait_seconds = (midnight - now).total_seconds()
+    # Run at noon UTC (8am Eastern) so US release-date games have actually launched
+    target = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    wait_seconds = (target - now).total_seconds()
     log.info("Next daily check in %.0f seconds", wait_seconds)
     await asyncio.sleep(wait_seconds)
 
