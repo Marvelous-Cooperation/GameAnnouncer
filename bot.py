@@ -488,6 +488,43 @@ async def fetch_game_store_info(session: aiohttp.ClientSession, igdb_id: int) ->
     return results.get(igdb_id, (None, None, None, None, None, None))
 
 
+async def fetch_steam_release_date(session: aiohttp.ClientSession, steam_app_id: str) -> int | None:
+    """Return the release timestamp from Steam's appdetails API, or None if unavailable/vague."""
+    from dateutil import parser as dateparser
+    url = f"https://store.steampowered.com/api/appdetails?appids={steam_app_id}&filters=release_date"
+    try:
+        async with session.get(url, headers=_BROWSER_UA,
+                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except Exception as e:
+        log.debug("Steam appdetails failed for %s: %s", steam_app_id, e)
+        return None
+
+    try:
+        rel = data[steam_app_id]["data"]["release_date"]
+    except (KeyError, TypeError):
+        return None
+
+    if rel.get("coming_soon") is False:
+        # Already released — still useful for date correction
+        pass
+    date_str = rel.get("date", "").strip()
+    if not date_str:
+        return None
+    # Skip vague dates like "2026" or "Q3 2026"
+    if re.fullmatch(r'Q?\d{1,2}\s*\d{4}|\d{4}', date_str):
+        return None
+    try:
+        dt = dateparser.parse(date_str)
+        if dt:
+            return int(dt.replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        pass
+    return None
+
+
 async def fetch_steam_unlock_time(session: aiohttp.ClientSession, steam_app_id: str) -> int | None:
     """Scrape the Steam store page for an exact unlock timestamp.
 
@@ -1102,6 +1139,28 @@ async def _sync_high_profile() -> int:
             con.commit()
             con.close()
             log.info("Backfilled store info for %d games", len(missing))
+
+        # Correct release dates using Steam's appdetails for any game where
+        # IGDB and Steam disagree (Steam dates are more reliable post-announcement)
+        con = sqlite3.connect(DB_PATH)
+        date_candidates = con.execute(
+            "SELECT igdb_id, name, steam_app_id, release_ts FROM watched_games "
+            "WHERE announced=0 AND steam_app_id IS NOT NULL"
+        ).fetchall()
+        con.close()
+        for igdb_id, name, steam_app_id, igdb_ts in date_candidates:
+            steam_ts = await fetch_steam_release_date(session, steam_app_id)
+            if steam_ts is None:
+                continue
+            # Only update if Steam's date differs by more than a day (ignore minor timezone rounding)
+            if igdb_ts is None or abs(steam_ts - igdb_ts) > 86400:
+                con = sqlite3.connect(DB_PATH)
+                con.execute("UPDATE watched_games SET release_ts=? WHERE igdb_id=?", (steam_ts, igdb_id))
+                con.commit()
+                con.close()
+                old = datetime.fromtimestamp(igdb_ts, tz=timezone.utc).strftime('%b %d') if igdb_ts else "TBA"
+                new = datetime.fromtimestamp(steam_ts, tz=timezone.utc).strftime('%b %d, %Y')
+                log.info("Corrected release date for %s: %s → %s (Steam)", name, old, new)
 
     return total
 
