@@ -637,6 +637,7 @@ async def fetch_steam_wishlist_games(session: aiohttp.ClientSession) -> list[dic
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="/", intents=intents)
+_announce_lock = asyncio.Lock()
 tree = bot.tree
 
 
@@ -1183,6 +1184,13 @@ def _store_links_line(game: dict) -> str | None:
 
 
 async def _announce_launches(include_overdue: bool = False):
+    if _announce_lock.locked():
+        return
+    async with _announce_lock:
+        await _do_announce_launches(include_overdue)
+
+
+async def _do_announce_launches(include_overdue: bool = False):
     igdb_launching = get_unannounced_launching_today()
     igdb_names = {g["name"].lower() for g in igdb_launching}
     steam_launching = [g for g in get_steam_launching_today() if g["name"].lower() not in igdb_names]
