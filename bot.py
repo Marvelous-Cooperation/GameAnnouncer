@@ -90,6 +90,54 @@ def init_db():
             channel_id  TEXT NOT NULL
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id     TEXT NOT NULL,
+            game_key    TEXT NOT NULL,   -- '*' for all launches, else 'igdb:<id>' / 'steam:<id>'
+            game_name   TEXT,
+            PRIMARY KEY (user_id, game_key)
+        )
+    """)
+    con.commit()
+    con.close()
+
+
+def add_subscription(user_id: int, game_key: str = "*", game_name: str | None = None):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("INSERT OR REPLACE INTO subscriptions VALUES (?,?,?)", (str(user_id), game_key, game_name))
+    con.commit()
+    con.close()
+
+
+def remove_subscriptions(user_id: int, game_key: str | None = None) -> int:
+    con = sqlite3.connect(DB_PATH)
+    if game_key is None:
+        cur = con.execute("DELETE FROM subscriptions WHERE user_id=?", (str(user_id),))
+    else:
+        cur = con.execute("DELETE FROM subscriptions WHERE user_id=? AND game_key=?", (str(user_id), game_key))
+    con.commit()
+    con.close()
+    return cur.rowcount
+
+
+def get_user_subscriptions(user_id: int) -> list[tuple[str, str | None]]:
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute("SELECT game_key, game_name FROM subscriptions WHERE user_id=?", (str(user_id),)).fetchall()
+    con.close()
+    return rows
+
+
+def get_subscribers_for(game_key: str) -> list[int]:
+    """User ids subscribed to everything or to this specific game."""
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute("SELECT DISTINCT user_id FROM subscriptions WHERE game_key IN ('*', ?)", (game_key,)).fetchall()
+    con.close()
+    return [int(r[0]) for r in rows]
+
+
+def clear_game_subscriptions(game_key: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("DELETE FROM subscriptions WHERE game_key=?", (game_key,))
     con.commit()
     con.close()
 
@@ -692,6 +740,9 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="/unwatch", value="Remove a game from the watch list.", inline=False)
     embed.add_field(name="/watchlist", value="Show all watched games privately (only you see it).", inline=False)
     embed.add_field(name="/postwatchlist", value="Post the watch list publicly in the channel.", inline=False)
+    embed.add_field(name="/subscribe [game]", value="Get a DM when any game launches, or just one you name.", inline=False)
+    embed.add_field(name="/unsubscribe [game]", value="Stop launch DMs for everything or one game.", inline=False)
+    embed.add_field(name="/subscriptions", value="See what you're subscribed to.", inline=False)
     embed.add_field(name="/setchannel", value="Set the channel where announcements are posted. *(Requires Manage Channels)*", inline=False)
     embed.add_field(name="/syncgames", value="Manually pull the latest high-profile games from IGDB + Steam. *(Requires Manage Server)*", inline=False)
     embed.add_field(name="/testannounce", value="Preview what a launch announcement looks like. *(Requires Manage Server)*", inline=False)
@@ -708,40 +759,110 @@ async def slash_setchannel(interaction: discord.Interaction, channel: discord.Te
     await interaction.response.send_message(f"Announcements will be posted in {target.mention}.", ephemeral=True)
 
 
-@tree.command(name="watch", description="Add an upcoming game to the watch list")
-@app_commands.describe(game="Name of the game to watch")
-async def slash_watch(interaction: discord.Interaction, game: str):
-    await interaction.response.defer(ephemeral=True)
+async def _add_watch(game: str) -> tuple[dict | None, str]:
+    """Search IGDB and add the top match to the watch list.
+
+    Returns (game_row_or_None, user_facing_message).
+    """
     async with aiohttp.ClientSession() as session:
         results = await search_game(session, game)
         if not results:
-            await interaction.followup.send(f"No games found matching **{game}**.")
-            return
+            return None, f"No games found matching **{game}**."
         result = results[0]
 
         release_ts = result.get("first_release_date")
         now_ts = datetime.now(timezone.utc).timestamp()
         if release_ts and release_ts <= now_ts:
             release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
-            await interaction.followup.send(
-                f"**{result['name']}** already launched ({release_dt.strftime('%b %d, %Y')}) — "
-                "only upcoming games can be added to the watch list."
-            )
-            return
+            return None, (f"**{result['name']}** already launched ({release_dt.strftime('%b %d, %Y')}) — "
+                          "only upcoming games can be added to the watch list.")
 
         image_url = await fetch_cover_url(session, result["id"])
         steam_app_id, platforms, ps_url, xbox_url, nsw_url, web_url = await fetch_game_store_info(session, result["id"])
 
     upsert_game(result["id"], result["name"], release_ts, manual=True, image_url=image_url, steam_app_id=steam_app_id, platforms=platforms, ps_url=ps_url, xbox_url=xbox_url, nsw_url=nsw_url, web_url=web_url)
+    await push_watchlist_to_website()
 
     if release_ts:
         release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
-        await interaction.followup.send(
-            f"Now watching **{result['name']}** — releases {discord.utils.format_dt(release_dt, 'D')}."
-        )
+        msg = f"Now watching **{result['name']}** — releases {discord.utils.format_dt(release_dt, 'D')}."
     else:
-        await interaction.followup.send(f"Now watching **{result['name']}** (no release date yet).")
-    await push_watchlist_to_website()
+        msg = f"Now watching **{result['name']}** (no release date yet)."
+    return {"igdb_id": result["id"], "name": result["name"]}, msg
+
+
+@tree.command(name="watch", description="Add an upcoming game to the watch list")
+@app_commands.describe(game="Name of the game to watch")
+async def slash_watch(interaction: discord.Interaction, game: str):
+    await interaction.response.defer(ephemeral=True)
+    _, msg = await _add_watch(game)
+    await interaction.followup.send(msg)
+
+
+def _find_tracked_game(query: str) -> dict | None:
+    """Best watchlist match for a name: returns {'key','name'} or None."""
+    q = query.lower()
+    for g in get_watchlist():
+        if q in g["name"].lower():
+            return {"key": f"igdb:{g['igdb_id']}", "name": g["name"]}
+    for g in get_steam_watchlist():
+        if q in g["name"].lower():
+            return {"key": f"steam:{g['steam_id']}", "name": g["name"]}
+    return None
+
+
+@tree.command(name="subscribe", description="Get a DM when games launch — all of them, or one you're waiting for")
+@app_commands.describe(game="Leave blank for every launch, or name a specific game")
+async def slash_subscribe(interaction: discord.Interaction, game: str | None = None):
+    await interaction.response.defer(ephemeral=True)
+    if not game:
+        add_subscription(interaction.user.id, "*")
+        await interaction.followup.send("You'll get a DM whenever any tracked game launches. "
+                                        "Make sure DMs from server members are enabled.")
+        return
+
+    match = _find_tracked_game(game)
+    extra = ""
+    if not match:
+        added, msg = await _add_watch(game)
+        if not added:
+            await interaction.followup.send(msg)
+            return
+        match = {"key": f"igdb:{added['igdb_id']}", "name": added["name"]}
+        extra = f"\n({msg})"
+
+    add_subscription(interaction.user.id, match["key"], match["name"])
+    await interaction.followup.send(f"You'll get a DM when **{match['name']}** launches.{extra}")
+
+
+@tree.command(name="unsubscribe", description="Stop launch DMs — for everything, or one game")
+@app_commands.describe(game="Leave blank to remove all your subscriptions, or name a game")
+async def slash_unsubscribe(interaction: discord.Interaction, game: str | None = None):
+    if not game:
+        n = remove_subscriptions(interaction.user.id)
+        await interaction.response.send_message(
+            f"Removed {n} subscription(s)." if n else "You had no subscriptions.", ephemeral=True)
+        return
+    q = game.lower()
+    subs = get_user_subscriptions(interaction.user.id)
+    hits = [(k, n) for k, n in subs if n and q in n.lower()]
+    if not hits:
+        await interaction.response.send_message(f"You aren't subscribed to anything matching **{game}**.", ephemeral=True)
+        return
+    for k, _ in hits:
+        remove_subscriptions(interaction.user.id, k)
+    names = ", ".join(f"**{n}**" for _, n in hits)
+    await interaction.response.send_message(f"Unsubscribed from {names}.", ephemeral=True)
+
+
+@tree.command(name="subscriptions", description="Show what launch DMs you're subscribed to")
+async def slash_subscriptions(interaction: discord.Interaction):
+    subs = get_user_subscriptions(interaction.user.id)
+    if not subs:
+        await interaction.response.send_message("You have no subscriptions. Use `/subscribe` to add one.", ephemeral=True)
+        return
+    lines = ["🔔 **All game launches**" if k == "*" else f"🎯 {n or k}" for k, n in subs]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @tree.command(name="unwatch", description="Remove a game from the watch list")
@@ -1328,9 +1449,26 @@ async def _do_announce_launches(include_overdue: bool = False):
 
         if "igdb_id" in game:
             mark_announced(game["igdb_id"])
+            game_key = f"igdb:{game['igdb_id']}"
         else:
             mark_steam_announced(game["steam_id"])
+            game_key = f"steam:{game['steam_id']}"
         log.info("Announced launch of %s", game["name"])
+
+        await _dm_subscribers(game_key, embed)
+        clear_game_subscriptions(game_key)
+
+
+async def _dm_subscribers(game_key: str, embed: discord.Embed):
+    """DM everyone subscribed to all launches or to this specific game."""
+    for user_id in get_subscribers_for(game_key):
+        try:
+            user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+            await user.send(embed=embed)
+        except discord.Forbidden:
+            log.info("Can't DM user %s (DMs closed)", user_id)
+        except Exception as e:
+            log.warning("DM to %s failed: %s", user_id, e)
 
 
 # ---------------------------------------------------------------------------
