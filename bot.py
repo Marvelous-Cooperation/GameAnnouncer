@@ -77,9 +77,13 @@ def init_db():
         con.execute("ALTER TABLE watched_games ADD COLUMN nsw_url TEXT")
     if "web_url" not in cols:
         con.execute("ALTER TABLE watched_games ADD COLUMN web_url TEXT")
+    if "review_notified" not in cols:
+        con.execute("ALTER TABLE watched_games ADD COLUMN review_notified INTEGER DEFAULT 0")
     steam_cols = [r[1] for r in con.execute("PRAGMA table_info(steam_games)").fetchall()]
     if "announced_at" not in steam_cols:
         con.execute("ALTER TABLE steam_games ADD COLUMN announced_at INTEGER")
+    if "review_notified" not in steam_cols:
+        con.execute("ALTER TABLE steam_games ADD COLUMN review_notified INTEGER DEFAULT 0")
     con.execute("""
         CREATE TABLE IF NOT EXISTS config (
             guild_id    TEXT PRIMARY KEY,
@@ -525,6 +529,29 @@ async def fetch_steam_release_date(session: aiohttp.ClientSession, steam_app_id:
     return None
 
 
+async def fetch_steam_review_score(session: aiohttp.ClientSession, steam_app_id: str) -> dict | None:
+    """Return Steam's review summary dict, or None if unavailable.
+
+    Keys: review_score (int 0-9), review_score_desc (str), total_positive,
+    total_negative, total_reviews.
+    """
+    url = (f"https://store.steampowered.com/appreviews/{steam_app_id}"
+           "?json=1&language=all&review_type=all&purchase_type=all&num_per_page=0")
+    try:
+        async with session.get(url, headers=_BROWSER_UA,
+                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except Exception as e:
+        log.debug("Steam reviews fetch failed for %s: %s", steam_app_id, e)
+        return None
+    summary = data.get("query_summary")
+    if not summary or summary.get("total_reviews", 0) == 0:
+        return None
+    return summary
+
+
 async def fetch_steam_unlock_time(session: aiohttp.ClientSession, steam_app_id: str) -> int | None:
     """Scrape the Steam store page for an exact unlock timestamp.
 
@@ -650,6 +677,7 @@ async def on_ready():
     weekly_watchlist.start()
     refresh_unlock_times.start()
     launch_monitor.start()
+    review_monitor.start()
     asyncio.create_task(_startup_check())
 
 
@@ -888,6 +916,77 @@ async def launch_monitor():
 @launch_monitor.before_loop
 async def before_launch_monitor():
     await bot.wait_until_ready()
+
+
+@tasks.loop(hours=6)
+async def review_monitor():
+    """Post a shout-out when a recently released game hits Overwhelmingly Positive on Steam."""
+    await _announce_review_milestones()
+
+
+@review_monitor.before_loop
+async def before_review_monitor():
+    await bot.wait_until_ready()
+
+
+async def _announce_review_milestones():
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    week_ago = now_ts - 7 * 86400
+
+    con = sqlite3.connect(DB_PATH)
+    igdb_rows = con.execute(
+        "SELECT igdb_id, name, steam_app_id, image_url FROM watched_games "
+        "WHERE announced=1 AND review_notified=0 AND steam_app_id IS NOT NULL "
+        "AND COALESCE(announced_at, release_ts) >= ?",
+        (week_ago,)
+    ).fetchall()
+    steam_rows = con.execute(
+        "SELECT steam_id, name, image_url FROM steam_games "
+        "WHERE announced=1 AND review_notified=0 "
+        "AND COALESCE(announced_at, release_ts) >= ?",
+        (week_ago,)
+    ).fetchall()
+    channels = con.execute("SELECT channel_id FROM config").fetchall()
+    con.close()
+
+    igdb_names = {r[1].lower() for r in igdb_rows}
+    candidates = [{"igdb_id": r[0], "name": r[1], "steam_app_id": r[2], "image_url": r[3]} for r in igdb_rows]
+    candidates += [{"steam_id": r[0], "name": r[1], "steam_app_id": r[0], "image_url": r[2]}
+                   for r in steam_rows if r[1].lower() not in igdb_names]
+    if not candidates:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        for game in candidates:
+            summary = await fetch_steam_review_score(session, game["steam_app_id"])
+            if not summary or summary.get("review_score_desc") != "Overwhelmingly Positive":
+                continue
+
+            total = summary["total_reviews"]
+            pct = round(100 * summary["total_positive"] / total)
+            embed = discord.Embed(
+                title="⭐ Overwhelmingly Positive on Steam!",
+                description=f"**{game['name']}** has reached Overwhelmingly Positive reviews on Steam!",
+                color=discord.Color.gold(),
+            )
+            embed.add_field(name="Reviews", value=f"{pct}% positive ({total:,} reviews)")
+            embed.add_field(name="Get it", value=f"[Steam](https://store.steampowered.com/app/{game['steam_app_id']}/)", inline=False)
+            if game.get("image_url"):
+                embed.set_image(url=game["image_url"])
+
+            for (channel_id,) in channels:
+                channel = bot.get_channel(int(channel_id))
+                if channel:
+                    await channel.send(embed=embed)
+
+            con = sqlite3.connect(DB_PATH)
+            if "igdb_id" in game:
+                con.execute("UPDATE watched_games SET review_notified=1 WHERE igdb_id=?", (game["igdb_id"],))
+            else:
+                con.execute("UPDATE steam_games SET review_notified=1 WHERE steam_id=?", (game["steam_id"],))
+            con.commit()
+            con.close()
+            log.info("Announced Overwhelmingly Positive milestone for %s", game["name"])
 
 
 @tasks.loop(hours=168)  # weekly
