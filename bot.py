@@ -27,6 +27,18 @@ log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DB_PATH", "games.db")
 
+# Store and Steam/IGDB give date-only releases as midnight UTC, which is the
+# previous evening in the US. Treat those as unlocking at Steam's usual
+# 10am Pacific (17:00 UTC) so we never announce before the game exists.
+DATE_ONLY_UNLOCK_HOUR_UTC = 17
+
+
+def date_only_ts(ts: int | None) -> int | None:
+    """Shift a midnight-UTC (date-only) timestamp to the assumed unlock hour."""
+    if ts is None:
+        return None
+    return (ts // 86400) * 86400 + DATE_ONLY_UNLOCK_HOUR_UTC * 3600
+
 # Push the watchlist to the club website after syncs/announcements (optional)
 WEBSITE_PUSH_URL = os.getenv("WEBSITE_PUSH_URL", "")
 WEBSITE_PUSH_KEY = os.getenv("WEBSITE_PUSH_KEY", "")
@@ -90,6 +102,9 @@ def init_db():
             channel_id  TEXT NOT NULL
         )
     """)
+    for tbl in ("watched_games", "steam_games"):
+        con.execute(f"UPDATE {tbl} SET release_ts = release_ts + {DATE_ONLY_UNLOCK_HOUR_UTC * 3600} "
+                    "WHERE announced=0 AND release_ts IS NOT NULL AND release_ts % 86400 = 0")
     con.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
             user_id     TEXT NOT NULL,
@@ -208,8 +223,8 @@ def get_unannounced_launching_today() -> list[dict]:
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
         "SELECT igdb_id, name, release_ts, image_url, steam_app_id, ps_url, xbox_url, nsw_url, web_url "
-        "FROM watched_games WHERE announced=0 AND release_ts>=? AND release_ts<?",
-        (start, end)
+        "FROM watched_games WHERE announced=0 AND release_ts>=? AND release_ts<? AND release_ts<=?",
+        (start, end, int(now.timestamp()))
     ).fetchall()
     con.close()
     return [{"igdb_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3],
@@ -283,8 +298,8 @@ def get_steam_launching_today() -> list[dict]:
     end = start + 86400
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        "SELECT steam_id, name, release_ts, image_url FROM steam_games WHERE announced=0 AND release_ts>=? AND release_ts<?",
-        (start, end)
+        "SELECT steam_id, name, release_ts, image_url FROM steam_games WHERE announced=0 AND release_ts>=? AND release_ts<? AND release_ts<=?",
+        (start, end, int(now.timestamp()))
     ).fetchall()
     con.close()
     return [{"steam_id": r[0], "name": r[1], "release_ts": r[2], "image_url": r[3]} for r in rows]
@@ -571,7 +586,7 @@ async def fetch_steam_release_date(session: aiohttp.ClientSession, steam_app_id:
     try:
         dt = dateparser.parse(date_str)
         if dt:
-            return int(dt.replace(tzinfo=timezone.utc).timestamp())
+            return date_only_ts(int(dt.replace(tzinfo=timezone.utc).timestamp()))
     except Exception:
         pass
     return None
@@ -696,7 +711,7 @@ async def fetch_steam_wishlist_games(session: aiohttp.ClientSession) -> list[dic
                 try:
                     dt = dateparser.parse(date_text)
                     if dt:
-                        release_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+                        release_ts = date_only_ts(int(dt.replace(tzinfo=timezone.utc).timestamp()))
                 except Exception:
                     pass
 
@@ -770,7 +785,7 @@ async def _add_watch(game: str) -> tuple[dict | None, str]:
             return None, f"No games found matching **{game}**."
         result = results[0]
 
-        release_ts = result.get("first_release_date")
+        release_ts = date_only_ts(result.get("first_release_date"))
         now_ts = datetime.now(timezone.utc).timestamp()
         if release_ts and release_ts <= now_ts:
             release_dt = datetime.fromtimestamp(release_ts, tz=timezone.utc)
@@ -1323,7 +1338,7 @@ async def _sync_high_profile() -> int:
             for g in valid:
                 image_url = await fetch_cover_url(session, g["id"])
                 steam_app_id, platforms, ps_url, xbox_url, nsw_url, web_url = store_info.get(g["id"], (None,) * 6)
-                upsert_game(g["id"], g["name"], g.get("first_release_date"), manual=False, image_url=image_url, source="igdb", steam_app_id=steam_app_id, platforms=platforms, ps_url=ps_url, xbox_url=xbox_url, nsw_url=nsw_url, web_url=web_url)
+                upsert_game(g["id"], g["name"], date_only_ts(g.get("first_release_date")), manual=False, image_url=image_url, source="igdb", steam_app_id=steam_app_id, platforms=platforms, ps_url=ps_url, xbox_url=xbox_url, nsw_url=nsw_url, web_url=web_url)
             log.info("Synced %d IGDB games", len(valid))
             total += len(valid)
         else:
