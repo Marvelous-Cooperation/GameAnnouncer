@@ -28,16 +28,19 @@ log = logging.getLogger(__name__)
 DB_PATH = os.getenv("DB_PATH", "games.db")
 
 # Store and Steam/IGDB give date-only releases as midnight UTC, which is the
-# previous evening in the US. Treat those as unlocking at Steam's usual
-# 10am Pacific (17:00 UTC) so we never announce before the game exists.
-DATE_ONLY_UNLOCK_HOUR_UTC = 17
+# previous evening in the US. Announce those at 8am Eastern on the launch
+# day instead, so "is out today" is true for everyone in the US.
+EASTERN = ZoneInfo("America/New_York")
+DATE_ONLY_ANNOUNCE_HOUR_ET = 8
 
 
 def date_only_ts(ts: int | None) -> int | None:
-    """Shift a midnight-UTC (date-only) timestamp to the assumed unlock hour."""
+    """Shift a midnight-UTC (date-only) timestamp to 8am Eastern that day."""
     if ts is None:
         return None
-    return (ts // 86400) * 86400 + DATE_ONLY_UNLOCK_HOUR_UTC * 3600
+    day = datetime.fromtimestamp((ts // 86400) * 86400, tz=timezone.utc)
+    local = datetime(day.year, day.month, day.day, DATE_ONLY_ANNOUNCE_HOUR_ET, tzinfo=EASTERN)
+    return int(local.timestamp())
 
 # Push the watchlist to the club website after syncs/announcements (optional)
 WEBSITE_PUSH_URL = os.getenv("WEBSITE_PUSH_URL", "")
@@ -102,9 +105,16 @@ def init_db():
             channel_id  TEXT NOT NULL
         )
     """)
+    # One-time normalization: midnight-UTC rows (never shifted) and 17:00-UTC
+    # rows from the previous scheme both move to 8am Eastern. Rows within 48h
+    # are left alone since those may hold precise scraped unlock times.
+    horizon = int(datetime.now(timezone.utc).timestamp()) + 48 * 3600
     for tbl in ("watched_games", "steam_games"):
-        con.execute(f"UPDATE {tbl} SET release_ts = release_ts + {DATE_ONLY_UNLOCK_HOUR_UTC * 3600} "
-                    "WHERE announced=0 AND release_ts IS NOT NULL AND release_ts % 86400 = 0")
+        rows = con.execute(f"SELECT rowid, release_ts FROM {tbl} WHERE announced=0 AND release_ts IS NOT NULL "
+                           "AND (release_ts % 86400 = 0 OR (release_ts % 86400 = 61200 AND release_ts > ?))",
+                           (horizon,)).fetchall()
+        for rowid, ts in rows:
+            con.execute(f"UPDATE {tbl} SET release_ts=? WHERE rowid=?", (date_only_ts(ts), rowid))
     con.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
             user_id     TEXT NOT NULL,
