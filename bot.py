@@ -565,9 +565,8 @@ async def fetch_game_store_info(session: aiohttp.ClientSession, igdb_id: int) ->
     return results.get(igdb_id, (None, None, None, None, None, None))
 
 
-async def fetch_steam_release_date(session: aiohttp.ClientSession, steam_app_id: str) -> int | None:
-    """Return the release timestamp from Steam's appdetails API, or None if unavailable/vague."""
-    from dateutil import parser as dateparser
+async def _fetch_steam_appdetails_release(session: aiohttp.ClientSession, steam_app_id: str) -> dict | None:
+    """Return the release_date block from Steam's appdetails API, or None if unavailable."""
     url = f"https://store.steampowered.com/api/appdetails?appids={steam_app_id}&filters=release_date"
     try:
         async with session.get(url, headers=_BROWSER_UA,
@@ -583,10 +582,24 @@ async def fetch_steam_release_date(session: aiohttp.ClientSession, steam_app_id:
         rel = data[steam_app_id]["data"]["release_date"]
     except (KeyError, TypeError):
         return None
+    return rel if isinstance(rel, dict) else None
 
-    if rel.get("coming_soon") is False:
-        # Already released — still useful for date correction
-        pass
+
+async def fetch_steam_coming_soon(session: aiohttp.ClientSession, steam_app_id: str) -> bool | None:
+    """Return True if Steam still lists the app as coming soon, False if it has
+    unlocked, or None if Steam couldn't tell us."""
+    rel = await _fetch_steam_appdetails_release(session, steam_app_id)
+    if rel is None or "coming_soon" not in rel:
+        return None
+    return bool(rel["coming_soon"])
+
+
+async def fetch_steam_release_date(session: aiohttp.ClientSession, steam_app_id: str) -> int | None:
+    """Return the release timestamp from Steam's appdetails API, or None if unavailable/vague."""
+    from dateutil import parser as dateparser
+    rel = await _fetch_steam_appdetails_release(session, steam_app_id)
+    if rel is None:
+        return None
     date_str = rel.get("date", "").strip()
     if not date_str:
         return None
@@ -628,8 +641,8 @@ async def fetch_steam_review_score(session: aiohttp.ClientSession, steam_app_id:
 async def fetch_steam_unlock_time(session: aiohttp.ClientSession, steam_app_id: str) -> int | None:
     """Scrape the Steam store page for an exact unlock timestamp.
 
-    Only returns a value when Steam is showing a countdown (typically 1-7 days
-    before launch). Returns None when the time isn't published yet.
+    Only returns a value when Steam has published an exact time (typically
+    within a couple of days of launch). Returns None when it isn't known yet.
     """
     url = f"https://store.steampowered.com/app/{steam_app_id}/"
     cookies = {"birthtime": "0", "lastagecheckage": "1-0-1990", "wants_mature_content": "1"}
@@ -643,14 +656,19 @@ async def fetch_steam_unlock_time(session: aiohttp.ClientSession, steam_app_id: 
         log.debug("Steam unlock scrape failed for app %s: %s", steam_app_id, e)
         return None
 
-    # Steam embeds the unlock Unix timestamp as data-timestamp on countdown elements
-    m = re.search(r'data-timestamp=["\'](\d{9,11})["\']', html)
+    # Steam embeds the exact unlock epoch as app_release_date in the reviews
+    # widget's data-props (HTML-escaped, so the quotes arrive as &quot;). Older
+    # markup used a data-timestamp attribute on countdown elements; keep that
+    # as a fallback.
+    m = (re.search(r'app_release_date(?:&quot;|")\s*:\s*(?:&quot;|")(\d{9,11})', html)
+         or re.search(r'data-timestamp=["\'](\d{9,11})["\']', html))
     if not m:
         return None
     ts = int(m.group(1))
     now = datetime.now(timezone.utc).timestamp()
-    # Sanity-check: must be a future time within 48 hours
-    if now < ts < now + 48 * 3600:
+    # Sanity-check: must be within 48 hours of now. A time that just passed is
+    # still useful because it lets the launch monitor announce promptly.
+    if now - 48 * 3600 < ts < now + 48 * 3600:
         return ts
     return None
 
@@ -1448,6 +1466,12 @@ async def _do_announce_launches(include_overdue: bool = False):
     if not launching:
         return
 
+    # Date-only rows carry an 8am Eastern placeholder, but real Steam unlocks
+    # vary by many hours. Hold anything Steam still lists as coming soon.
+    launching = await _filter_unreleased_on_steam(launching)
+    if not launching:
+        return
+
     con = sqlite3.connect(DB_PATH)
     channels = con.execute("SELECT channel_id FROM config").fetchall()
     con.close()
@@ -1482,6 +1506,45 @@ async def _do_announce_launches(include_overdue: bool = False):
 
         await _dm_subscribers(game_key, embed)
         clear_game_subscriptions(game_key)
+
+
+async def _filter_unreleased_on_steam(games: list[dict]) -> list[dict]:
+    """Drop games that Steam still lists as coming soon.
+
+    Games without a Steam app id, or where Steam can't be reached, pass
+    through unchanged so an outage never swallows an announcement. Held games
+    get their release_ts refined from the store page when Steam publishes an
+    exact unlock time, so the launch monitor picks them up on time.
+    """
+    ready = []
+    async with aiohttp.ClientSession() as session:
+        for game in games:
+            app_id = game.get("steam_app_id") or game.get("steam_id")
+            if not app_id:
+                ready.append(game)
+                continue
+            app_id = str(app_id)
+            coming_soon = await fetch_steam_coming_soon(session, app_id)
+            if coming_soon is not True:
+                ready.append(game)
+                continue
+
+            unlock_ts = await fetch_steam_unlock_time(session, app_id)
+            if unlock_ts and unlock_ts != game.get("release_ts"):
+                con = sqlite3.connect(DB_PATH)
+                if "igdb_id" in game:
+                    con.execute("UPDATE watched_games SET release_ts=? WHERE igdb_id=?",
+                                (unlock_ts, game["igdb_id"]))
+                else:
+                    con.execute("UPDATE steam_games SET release_ts=? WHERE steam_id=?",
+                                (unlock_ts, game["steam_id"]))
+                con.commit()
+                con.close()
+                log.info("Holding %s: Steam still lists it as coming soon (unlocks %s UTC)", game["name"],
+                         datetime.fromtimestamp(unlock_ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M'))
+            else:
+                log.info("Holding %s: Steam still lists it as coming soon", game["name"])
+    return ready
 
 
 async def _dm_subscribers(game_key: str, embed: discord.Embed):
