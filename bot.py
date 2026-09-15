@@ -585,6 +585,22 @@ async def _fetch_steam_appdetails_release(session: aiohttp.ClientSession, steam_
     return rel if isinstance(rel, dict) else None
 
 
+async def fetch_steam_header_image(session: aiohttp.ClientSession, steam_app_id: str) -> str | None:
+    """Return the canonical header image URL from Steam's appdetails API, or None."""
+    url = f"https://store.steampowered.com/api/appdetails?appids={steam_app_id}&filters=basic"
+    try:
+        async with session.get(url, headers=_BROWSER_UA,
+                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+        header = data[steam_app_id]["data"]["header_image"]
+    except Exception as e:
+        log.debug("Steam header lookup failed for %s: %s", steam_app_id, e)
+        return None
+    return header if isinstance(header, str) and header.startswith("http") else None
+
+
 async def fetch_steam_coming_soon(session: aiohttp.ClientSession, steam_app_id: str) -> bool | None:
     """Return True if Steam still lists the app as coming soon, False if it has
     unlocked, or None if Steam couldn't tell us."""
@@ -716,17 +732,18 @@ async def fetch_steam_wishlist_games(session: aiohttp.ClientSession) -> list[dic
 
     for item in items[:20]:
         app_id = item.get("data-ds-appid")
+        # Bundles list several app ids comma-separated; use the first so store
+        # links, header lookups and the coming-soon check target a real app.
+        if app_id and "," in app_id:
+            app_id = app_id.split(",")[0].strip()
         name_tag = item.select_one(".title")
         if not app_id or not name_tag:
             continue
         name = name_tag.get_text(strip=True)
 
-        # Header image from the capsule
-        img_tag = item.select_one("img")
-        image_url = img_tag["src"] if img_tag else None
-        # Use the larger header image instead of capsule thumbnail
-        if app_id:
-            image_url = f"https://cdn.akamai.steamstatic.com/steam/apps/{app_id}/header.jpg"
+        # Legacy CDN path; newer apps only exist under a hashed asset path that
+        # can't be derived here, so this gets replaced via appdetails below.
+        image_url = f"https://cdn.akamai.steamstatic.com/steam/apps/{app_id}/header.jpg"
 
         # Release date — skip vague dates like "2026" or "Q1 2026" (no specific day)
         release_ts = None
@@ -744,6 +761,13 @@ async def fetch_steam_wishlist_games(session: aiohttp.ClientSession) -> list[dic
                     pass
 
         games.append({"steam_id": app_id, "name": name, "release_ts": release_ts, "image_url": image_url})
+
+    # Steam's appdetails carries the canonical header URL (hashed path for
+    # newer apps). Fall back to the legacy guess when it isn't available.
+    for g in games:
+        header = await fetch_steam_header_image(session, g["steam_id"])
+        if header:
+            g["image_url"] = header
 
     log.info("Fetched %d games from Steam wishlist", len(games))
     return games
