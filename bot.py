@@ -323,6 +323,52 @@ def mark_steam_announced(steam_id: str):
     con.close()
 
 
+def _twin_keys(game: dict) -> tuple[str, str]:
+    """(lower-cased name, steam app id or '') used to match the same game across tables."""
+    return game["name"].strip().lower(), str(game.get("steam_app_id") or game.get("steam_id") or "")
+
+
+def is_announced_elsewhere(game: dict) -> bool:
+    """True if this game is already marked announced in either table.
+
+    The same title can arrive from IGDB (watched_games) and from the Steam
+    wishlist (steam_games) as separate rows, and the announced flag is per
+    row. Matching by Steam app id or name stops the second row from firing.
+    """
+    name, steam_id = _twin_keys(game)
+    con = sqlite3.connect(DB_PATH)
+    hit = con.execute(
+        "SELECT 1 FROM watched_games WHERE announced=1 "
+        "AND (LOWER(TRIM(name))=? OR (steam_app_id IS NOT NULL AND CAST(steam_app_id AS TEXT)=?)) "
+        "UNION ALL "
+        "SELECT 1 FROM steam_games WHERE announced=1 "
+        "AND (LOWER(TRIM(name))=? OR CAST(steam_id AS TEXT)=?) "
+        "LIMIT 1",
+        (name, steam_id, name, steam_id)
+    ).fetchone()
+    con.close()
+    return hit is not None
+
+
+def mark_twins_announced(game: dict):
+    """Mark any other unannounced row for the same game (either table) as announced."""
+    name, steam_id = _twin_keys(game)
+    now = int(datetime.now(timezone.utc).timestamp())
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "UPDATE watched_games SET announced=1, announced_at=? WHERE announced=0 "
+        "AND (LOWER(TRIM(name))=? OR (steam_app_id IS NOT NULL AND CAST(steam_app_id AS TEXT)=?))",
+        (now, name, steam_id)
+    )
+    con.execute(
+        "UPDATE steam_games SET announced=1, announced_at=? WHERE announced=0 "
+        "AND (LOWER(TRIM(name))=? OR CAST(steam_id AS TEXT)=?)",
+        (now, name, steam_id)
+    )
+    con.commit()
+    con.close()
+
+
 # ---------------------------------------------------------------------------
 # IGDB helpers
 # ---------------------------------------------------------------------------
@@ -1477,16 +1523,39 @@ async def _announce_launches(include_overdue: bool = False):
         await _do_announce_launches(include_overdue)
 
 
-async def _do_announce_launches(include_overdue: bool = False):
-    igdb_launching = get_unannounced_launching_today()
-    igdb_names = {g["name"].lower() for g in igdb_launching}
-    steam_launching = [g for g in get_steam_launching_today() if g["name"].lower() not in igdb_names]
-    launching = igdb_launching + steam_launching
+def _dedup_same_game(games: list[dict]) -> list[dict]:
+    """Keep the first row per game, matching by Steam app id or trimmed name."""
+    seen_names, seen_ids, out = set(), set(), []
+    for g in games:
+        name, steam_id = _twin_keys(g)
+        if name in seen_names or (steam_id and steam_id in seen_ids):
+            continue
+        seen_names.add(name)
+        if steam_id:
+            seen_ids.add(steam_id)
+        out.append(g)
+    return out
 
+
+async def _do_announce_launches(include_overdue: bool = False):
+    # IGDB rows first so the richer embed (platforms, store links) wins.
+    launching = get_unannounced_launching_today() + get_steam_launching_today()
     if include_overdue:
-        today_names = {g["name"].lower() for g in launching}
-        overdue = [g for g in get_overdue_unannounced() if g["name"].lower() not in today_names]
-        launching += overdue
+        launching += get_overdue_unannounced()
+    launching = _dedup_same_game(launching)
+    if not launching:
+        return
+
+    # A game can exist as both an IGDB row and a Steam-wishlist row. If either
+    # copy has already been announced, silently retire the other.
+    fresh = []
+    for game in launching:
+        if is_announced_elsewhere(game):
+            mark_twins_announced(game)
+            log.info("Skipping %s: already announced from another source", game["name"])
+        else:
+            fresh.append(game)
+    launching = fresh
     if not launching:
         return
 
@@ -1501,6 +1570,10 @@ async def _do_announce_launches(include_overdue: bool = False):
     con.close()
 
     for game in launching:
+        if is_announced_elsewhere(game):
+            mark_twins_announced(game)
+            log.info("Skipping %s: already announced from another source", game["name"])
+            continue
         embed = discord.Embed(
             title="🎮 Game Launch Today!",
             description=f"**{game['name']}** is out today!",
@@ -1526,6 +1599,7 @@ async def _do_announce_launches(include_overdue: bool = False):
         else:
             mark_steam_announced(game["steam_id"])
             game_key = f"steam:{game['steam_id']}"
+        mark_twins_announced(game)
         log.info("Announced launch of %s", game["name"])
 
         await _dm_subscribers(game_key, embed)
