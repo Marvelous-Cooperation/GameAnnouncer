@@ -8,6 +8,8 @@ A Discord bot that tracks upcoming game releases and announces them on launch da
 - **Manual tracking** — add any game by name with `/watch`
 - **Launch announcements** — posts an embed with cover art on the day a tracked game releases
 - **Weekly digest** — automatically posts the full watch list every Friday at 6pm EST
+- **Review milestones** — shouts out tracked games that reach Overwhelmingly Positive on Steam after launch
+- **Sleeper hits** — spots games *not* on the watch list that hit Overwhelmingly Positive within a month of release
 - **Deduplication** — games appearing in both IGDB and Steam are shown only once
 
 ## Commands
@@ -86,5 +88,6 @@ The bot is designed to run continuously. [Railway](https://railway.com) is recom
 
 - **Daily at midnight UTC** — syncs IGDB and Steam for new/updated games, announces any games launching that day
 - **Every Friday at 6pm EST** — syncs and posts the full watch list to the announcement channel
+- **Every 6 hours** — checks Steam reviews for tracked games that just launched, and scans Steam's Popular New Releases for untracked games that hit Overwhelmingly Positive within `SLEEPER_HIT_WINDOW_DAYS` (default 30) of release; each game is announced once
 - Game data is stored in a local SQLite database (`games.db`)
 - IGDB images (artwork/cover) and Steam header images are embedded in announcements

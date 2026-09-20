@@ -42,6 +42,10 @@ def date_only_ts(ts: int | None) -> int | None:
     local = datetime(day.year, day.month, day.day, DATE_ONLY_ANNOUNCE_HOUR_ET, tzinfo=EASTERN)
     return int(local.timestamp())
 
+# Untracked games that hit Overwhelmingly Positive within this many days of
+# release get a "sleeper hit" shout-out
+SLEEPER_HIT_WINDOW_DAYS = int(os.getenv("SLEEPER_HIT_WINDOW_DAYS", "30"))
+
 # Push the watchlist to the club website after syncs/announcements (optional)
 WEBSITE_PUSH_URL = os.getenv("WEBSITE_PUSH_URL", "")
 WEBSITE_PUSH_KEY = os.getenv("WEBSITE_PUSH_KEY", "")
@@ -121,6 +125,14 @@ def init_db():
             game_key    TEXT NOT NULL,   -- '*' for all launches, else 'igdb:<id>' / 'steam:<id>'
             game_name   TEXT,
             PRIMARY KEY (user_id, game_key)
+        )
+    """)
+    # Untracked new releases already shouted out for hitting Overwhelmingly Positive
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS sleeper_hits (
+            steam_id    TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            notified_at INTEGER
         )
     """)
     con.commit()
@@ -819,6 +831,79 @@ async def fetch_steam_wishlist_games(session: aiohttp.ClientSession) -> list[dic
     return games
 
 
+async def fetch_steam_popular_new_releases(session: aiohttp.ClientSession, max_pages: int = 4) -> list[dict]:
+    """Fetch Steam's Popular New Releases list with each game's review summary.
+
+    The search results carry the review tooltip ("Overwhelmingly Positive<br>
+    96% of the 1,234 user reviews...") and release date inline, so a whole
+    page is checked with one request. Games without a review summary are
+    skipped.
+    """
+    from bs4 import BeautifulSoup
+    from dateutil import parser as dateparser
+
+    headers = {**_BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"}
+    games = []
+    for page in range(max_pages):
+        url = (
+            "https://store.steampowered.com/search/results/"
+            f"?filter=popularnew&cc=us&l=en&count=100&start={page * 100}"
+            "&category1=998&infinite=1&json=1"
+        )
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    break
+                data = await resp.json(content_type=None)
+            html = data.get("results_html", "")
+        except Exception as e:
+            log.error("Failed to fetch Steam popular new releases (page %d): %s", page, e)
+            break
+
+        items = BeautifulSoup(html, "html.parser").select("a.search_result_row")
+        if not items:
+            break
+        for item in items:
+            app_id = item.get("data-ds-appid")
+            if app_id and "," in app_id:
+                app_id = app_id.split(",")[0].strip()
+            name_tag = item.select_one(".title")
+            summary_tag = item.select_one(".search_review_summary")
+            if not app_id or not name_tag or not summary_tag:
+                continue
+            tooltip = summary_tag.get("data-tooltip-html", "")
+            m = re.match(r"([^<]+)<br>\s*(\d+)% of the ([\d,]+) user reviews", tooltip)
+            if not m:
+                continue
+
+            release_ts = None
+            date_tag = item.select_one(".search_released")
+            date_text = date_tag.get_text(strip=True) if date_tag else ""
+            if date_text and not re.fullmatch(r'Q?\d{1,2}\s*\d{4}|\d{4}', date_text):
+                try:
+                    dt = dateparser.parse(date_text)
+                    if dt:
+                        release_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+                except Exception:
+                    pass
+
+            games.append({
+                "steam_id": app_id,
+                "name": name_tag.get_text(strip=True),
+                "release_ts": release_ts,
+                "review_desc": m.group(1).strip(),
+                "review_pct": int(m.group(2)),
+                "review_total": int(m.group(3).replace(",", "")),
+            })
+
+        total = data.get("total_count") or 0
+        if (page + 1) * 100 >= total:
+            break
+
+    log.info("Fetched %d games from Steam popular new releases", len(games))
+    return games
+
+
 # ---------------------------------------------------------------------------
 # Bot
 # ---------------------------------------------------------------------------
@@ -1156,6 +1241,7 @@ async def before_launch_monitor():
 async def review_monitor():
     """Post a shout-out when a recently released game hits Overwhelmingly Positive on Steam."""
     await _announce_review_milestones()
+    await _announce_sleeper_hits()
 
 
 @review_monitor.before_loop
@@ -1221,6 +1307,77 @@ async def _announce_review_milestones():
             con.commit()
             con.close()
             log.info("Announced Overwhelmingly Positive milestone for %s", game["name"])
+
+
+def _is_tracked_game(name: str, steam_id: str) -> bool:
+    """True if the game has a row in either watch table, announced or not."""
+    key = name.strip().lower()
+    con = sqlite3.connect(DB_PATH)
+    hit = con.execute(
+        "SELECT 1 FROM watched_games "
+        "WHERE LOWER(TRIM(name))=? OR (steam_app_id IS NOT NULL AND CAST(steam_app_id AS TEXT)=?) "
+        "UNION ALL "
+        "SELECT 1 FROM steam_games WHERE LOWER(TRIM(name))=? OR CAST(steam_id AS TEXT)=? "
+        "LIMIT 1",
+        (key, steam_id, key, steam_id)
+    ).fetchone()
+    con.close()
+    return hit is not None
+
+
+async def _announce_sleeper_hits():
+    """Shout out untracked games that hit Overwhelmingly Positive within a month of release.
+
+    Tracked games get their milestone from _announce_review_milestones; this
+    catches the surprise hits nobody had on the watch list.
+    """
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    window_start = now_ts - SLEEPER_HIT_WINDOW_DAYS * 86400
+
+    async with aiohttp.ClientSession() as session:
+        releases = await fetch_steam_popular_new_releases(session)
+        if not releases:
+            return
+
+        con = sqlite3.connect(DB_PATH)
+        already = {r[0] for r in con.execute("SELECT steam_id FROM sleeper_hits").fetchall()}
+        channels = con.execute("SELECT channel_id FROM config").fetchall()
+        con.close()
+
+        for game in releases:
+            if game["review_desc"] != "Overwhelmingly Positive":
+                continue
+            if game["release_ts"] is None or not (window_start <= game["release_ts"] <= now_ts + 86400):
+                continue
+            if game["steam_id"] in already or _is_tracked_game(game["name"], game["steam_id"]):
+                continue
+
+            released = datetime.fromtimestamp(game["release_ts"], tz=timezone.utc)
+            embed = discord.Embed(
+                title="💎 Sleeper Hit!",
+                description=(f"**{game['name']}** wasn't on our radar, but it's hit "
+                             f"Overwhelmingly Positive reviews on Steam within a month of release."),
+                color=discord.Color.purple(),
+            )
+            embed.add_field(name="Released", value=discord.utils.format_dt(released, "D"))
+            embed.add_field(name="Reviews", value=f"{game['review_pct']}% positive ({game['review_total']:,} reviews)")
+            embed.add_field(name="Get it", value=f"[Steam](https://store.steampowered.com/app/{game['steam_id']}/)", inline=False)
+            image_url = await fetch_steam_header_image(session, game["steam_id"])
+            if image_url:
+                embed.set_image(url=image_url)
+
+            for (channel_id,) in channels:
+                channel = bot.get_channel(int(channel_id))
+                if channel:
+                    await channel.send(embed=embed)
+
+            con = sqlite3.connect(DB_PATH)
+            con.execute("INSERT OR REPLACE INTO sleeper_hits (steam_id, name, notified_at) VALUES (?,?,?)",
+                        (game["steam_id"], game["name"], now_ts))
+            con.commit()
+            con.close()
+            already.add(game["steam_id"])
+            log.info("Announced sleeper hit %s (%d%%, %d reviews)", game["name"], game["review_pct"], game["review_total"])
 
 
 @tasks.loop(hours=168)  # weekly
