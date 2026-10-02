@@ -409,6 +409,14 @@ def is_announced_elsewhere(game: dict) -> bool:
     return any(r["announced"] for r in _twin_rows(game))
 
 
+def _mark_game_announced(game: dict):
+    """Retire this row itself (whichever table it came from)."""
+    if "igdb_id" in game:
+        mark_announced(game["igdb_id"])
+    else:
+        mark_steam_announced(game["steam_id"])
+
+
 def mark_twins_announced(game: dict):
     """Mark any other unannounced row for the same game (either table) as announced."""
     now = int(datetime.now(timezone.utc).timestamp())
@@ -1832,6 +1840,7 @@ async def _do_announce_launches(include_overdue: bool = False):
     fresh = []
     for game in launching:
         if is_announced_elsewhere(game):
+            _mark_game_announced(game)
             mark_twins_announced(game)
             log.info("Skipping %s: already announced from another source", game["name"])
         else:
@@ -1852,6 +1861,7 @@ async def _do_announce_launches(include_overdue: bool = False):
 
     for game in launching:
         if is_announced_elsewhere(game):
+            _mark_game_announced(game)
             mark_twins_announced(game)
             log.info("Skipping %s: already announced from another source", game["name"])
             continue
