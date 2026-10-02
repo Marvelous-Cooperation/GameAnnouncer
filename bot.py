@@ -119,6 +119,20 @@ def init_db():
                            (horizon,)).fetchall()
         for rowid, ts in rows:
             con.execute(f"UPDATE {tbl} SET release_ts=? WHERE rowid=?", (date_only_ts(ts), rowid))
+    # Bundle listings used to be keyed by Steam's comma-separated app-id list;
+    # the wishlist sync now keys them by the first id. Fold any leftover comma
+    # rows into the single-id row (or rename them) so a game isn't listed twice.
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    for steam_id, announced in con.execute(
+            "SELECT steam_id, announced FROM steam_games WHERE steam_id LIKE '%,%'").fetchall():
+        first = steam_id.split(",")[0].strip()
+        if con.execute("SELECT 1 FROM steam_games WHERE steam_id=?", (first,)).fetchone():
+            if announced:
+                con.execute("UPDATE steam_games SET announced=1, announced_at=COALESCE(announced_at, ?) "
+                            "WHERE steam_id=?", (now_ts, first))
+            con.execute("DELETE FROM steam_games WHERE steam_id=?", (steam_id,))
+        else:
+            con.execute("UPDATE steam_games SET steam_id=? WHERE steam_id=?", (first, steam_id))
     con.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
             user_id     TEXT NOT NULL,
@@ -1269,10 +1283,10 @@ async def _announce_review_milestones():
     channels = con.execute("SELECT channel_id FROM config").fetchall()
     con.close()
 
-    igdb_names = {r[1].lower() for r in igdb_rows}
     candidates = [{"igdb_id": r[0], "name": r[1], "steam_app_id": r[2], "image_url": r[3]} for r in igdb_rows]
     candidates += [{"steam_id": r[0], "name": r[1], "steam_app_id": r[0], "image_url": r[2]}
-                   for r in steam_rows if r[1].lower() not in igdb_names]
+                   for r in steam_rows]
+    candidates = _dedup_same_game(candidates)
     if not candidates:
         return
 
@@ -1464,13 +1478,12 @@ def _build_watchlist_embeds() -> list[discord.Embed]:
         name = f"[{g['name']}]({url})" if url else f"**{g['name']}**"
         return f"{tag} {name}{platform_badges(g)} — {date_str(g['release_ts'])}"
 
-    igdb_names = {g["name"].lower() for g in igdb_games}
-    all_games = []
-    for g in igdb_games:
-        all_games.append({**g, "tag": "📌" if g["manual"] else "🔥"})
-    for g in steam_games:
-        if g["name"].lower() not in igdb_names:
-            all_games.append({**g, "tag": "🎮"})
+    # IGDB rows first so their richer entry wins; then drop anything that is
+    # the same game by Steam app id or name (IGDB vs Steam copies, or two
+    # Steam rows left over from a bundle id change).
+    all_games = [{**g, "tag": "📌" if g["manual"] else "🔥"} for g in igdb_games]
+    all_games += [{**g, "tag": "🎮"} for g in steam_games]
+    all_games = _dedup_same_game(all_games)
 
     all_games.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
 
@@ -1526,13 +1539,13 @@ def _build_site_payload() -> dict:
          "ps_url": r[6], "xbox_url": r[7], "nsw_url": r[8], "web_url": r[9]}
         for r in igdb_rows
     ]
-    seen = {g["name"].lower() for g in upcoming}
     upcoming += [
         {"name": r[0], "release_ts": r[1], "tag": "steam",
          "image_url": r[2], "steam_app_id": r[3], "platforms": None,
          "ps_url": None, "xbox_url": None, "nsw_url": None, "web_url": None}
-        for r in steam_rows if r[0].lower() not in seen
+        for r in steam_rows
     ]
+    upcoming = _dedup_same_game(upcoming)
     upcoming.sort(key=lambda g: g["release_ts"] if g["release_ts"] else float("inf"))
 
     featured = None
