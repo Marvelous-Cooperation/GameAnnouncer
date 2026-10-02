@@ -350,49 +350,149 @@ def mark_steam_announced(steam_id: str):
 
 
 def _twin_keys(game: dict) -> tuple[str, str]:
-    """(lower-cased name, steam app id or '') used to match the same game across tables."""
-    return game["name"].strip().lower(), str(game.get("steam_app_id") or game.get("steam_id") or "")
+    """(normalized name, steam app id or '') used to match the same game across rows.
+
+    The name is lower-cased with punctuation and spaces stripped, so
+    "Dragon's Dogma 2: Dark Arisen" and "Dragons Dogma 2 - Dark Arisen" match.
+    """
+    return _norm_title(game["name"]), str(game.get("steam_app_id") or game.get("steam_id") or "")
+
+
+def _same_game(a: dict, b: dict) -> bool:
+    na, ia = _twin_keys(a)
+    nb, ib = _twin_keys(b)
+    return bool((ia and ia == ib) or (na and na == nb))
+
+
+def _load_all_rows() -> tuple[list[dict], list[dict]]:
+    """Every row from both tables, in insertion order, as dicts."""
+    con = sqlite3.connect(DB_PATH)
+    watched = [
+        {"igdb_id": r[0], "name": r[1], "steam_app_id": r[2], "announced": r[3] or 0,
+         "announced_at": r[4], "manual": r[5] or 0, "image_url": r[6]}
+        for r in con.execute("SELECT igdb_id, name, steam_app_id, announced, announced_at, manual, image_url "
+                             "FROM watched_games ORDER BY rowid")
+    ]
+    steam = [
+        {"steam_id": r[0], "name": r[1], "announced": r[2] or 0, "announced_at": r[3], "image_url": r[4]}
+        for r in con.execute("SELECT steam_id, name, announced, announced_at, image_url "
+                             "FROM steam_games ORDER BY rowid")
+    ]
+    con.close()
+    return watched, steam
+
+
+def _twin_rows(game: dict) -> list[dict]:
+    """Other rows (either table) that describe the same game as `game`."""
+    watched, steam = _load_all_rows()
+    twins = []
+    for r in watched:
+        if "igdb_id" in game and r["igdb_id"] == game["igdb_id"]:
+            continue
+        if _same_game(game, r):
+            twins.append(r)
+    for r in steam:
+        if "steam_id" in game and str(r["steam_id"]) == str(game["steam_id"]):
+            continue
+        if _same_game(game, r):
+            twins.append(r)
+    return twins
 
 
 def is_announced_elsewhere(game: dict) -> bool:
-    """True if this game is already marked announced in either table.
+    """True if another row for this game (either table) is already announced.
 
-    The same title can arrive from IGDB (watched_games) and from the Steam
+    The same title can arrive from IGDB (watched_games) and the Steam
     wishlist (steam_games) as separate rows, and the announced flag is per
     row. Matching by Steam app id or name stops the second row from firing.
     """
-    name, steam_id = _twin_keys(game)
-    con = sqlite3.connect(DB_PATH)
-    hit = con.execute(
-        "SELECT 1 FROM watched_games WHERE announced=1 "
-        "AND (LOWER(TRIM(name))=? OR (steam_app_id IS NOT NULL AND CAST(steam_app_id AS TEXT)=?)) "
-        "UNION ALL "
-        "SELECT 1 FROM steam_games WHERE announced=1 "
-        "AND (LOWER(TRIM(name))=? OR CAST(steam_id AS TEXT)=?) "
-        "LIMIT 1",
-        (name, steam_id, name, steam_id)
-    ).fetchone()
-    con.close()
-    return hit is not None
+    return any(r["announced"] for r in _twin_rows(game))
 
 
 def mark_twins_announced(game: dict):
     """Mark any other unannounced row for the same game (either table) as announced."""
-    name, steam_id = _twin_keys(game)
     now = int(datetime.now(timezone.utc).timestamp())
     con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "UPDATE watched_games SET announced=1, announced_at=? WHERE announced=0 "
-        "AND (LOWER(TRIM(name))=? OR (steam_app_id IS NOT NULL AND CAST(steam_app_id AS TEXT)=?))",
-        (now, name, steam_id)
-    )
-    con.execute(
-        "UPDATE steam_games SET announced=1, announced_at=? WHERE announced=0 "
-        "AND (LOWER(TRIM(name))=? OR CAST(steam_id AS TEXT)=?)",
-        (now, name, steam_id)
-    )
+    for r in _twin_rows(game):
+        if r["announced"]:
+            continue
+        if "igdb_id" in r:
+            con.execute("UPDATE watched_games SET announced=1, announced_at=? WHERE igdb_id=?", (now, r["igdb_id"]))
+        else:
+            con.execute("UPDATE steam_games SET announced=1, announced_at=? WHERE steam_id=?", (now, r["steam_id"]))
     con.commit()
     con.close()
+
+
+def reconcile_duplicates() -> list[str]:
+    """Merge rows that describe the same game, so it is tracked exactly once.
+
+    Runs after every sync and every manual /watch. Three passes:
+      1. a Steam-wishlist row that matches an IGDB row folds into the IGDB
+         row (richer: platforms, store links);
+      2. Steam rows that match each other (e.g. a bundle whose id changed)
+         keep the earliest / already-announced one;
+      3. IGDB rows that match each other keep the manual one, else the
+         earliest.
+    Announced state, image and launch subscriptions carry over to the
+    surviving row. Returns one note per merge for logging.
+    """
+    notes: list[str] = []
+    con = sqlite3.connect(DB_PATH)
+
+    def absorb(table: str, key_col: str, key, dropped: dict):
+        con.execute(
+            f"UPDATE {table} SET announced=MAX(announced, ?), "
+            f"announced_at=COALESCE(announced_at, ?), image_url=COALESCE(image_url, ?) WHERE {key_col}=?",
+            (dropped["announced"], dropped["announced_at"] if dropped["announced"] else None,
+             dropped["image_url"], key))
+
+    def move_subs(old_key: str, new_key: str):
+        con.execute("UPDATE OR REPLACE subscriptions SET game_key=? WHERE game_key=?", (new_key, old_key))
+
+    # 1. Steam rows that duplicate an IGDB row.
+    watched, steam = _load_all_rows()
+    for sr in steam:
+        twin = next((wr for wr in watched if _same_game(sr, wr)), None)
+        if twin is None:
+            continue
+        absorb("watched_games", "igdb_id", twin["igdb_id"], sr)
+        move_subs(f"steam:{sr['steam_id']}", f"igdb:{twin['igdb_id']}")
+        con.execute("DELETE FROM steam_games WHERE steam_id=?", (sr["steam_id"],))
+        notes.append(f"Merged Steam entry '{sr['name']}' into IGDB entry '{twin['name']}'")
+    con.commit()
+
+    # 2. Steam rows that duplicate each other.
+    _, steam = _load_all_rows()
+    steam.sort(key=lambda r: -r["announced"])  # stable: announced first, then insertion order
+    kept: list[dict] = []
+    for sr in steam:
+        twin = next((k for k in kept if _same_game(sr, k)), None)
+        if twin is None:
+            kept.append(sr)
+            continue
+        absorb("steam_games", "steam_id", twin["steam_id"], sr)
+        move_subs(f"steam:{sr['steam_id']}", f"steam:{twin['steam_id']}")
+        con.execute("DELETE FROM steam_games WHERE steam_id=?", (sr["steam_id"],))
+        notes.append(f"Merged duplicate Steam entry '{sr['name']}' ({sr['steam_id']}) into {twin['steam_id']}")
+    con.commit()
+
+    # 3. IGDB rows that duplicate each other.
+    watched, _ = _load_all_rows()
+    watched.sort(key=lambda r: -r["manual"])  # stable: manual picks first, then insertion order
+    kept = []
+    for wr in watched:
+        twin = next((k for k in kept if _same_game(wr, k)), None)
+        if twin is None:
+            kept.append(wr)
+            continue
+        absorb("watched_games", "igdb_id", twin["igdb_id"], wr)
+        move_subs(f"igdb:{wr['igdb_id']}", f"igdb:{twin['igdb_id']}")
+        con.execute("DELETE FROM watched_games WHERE igdb_id=?", (wr["igdb_id"],))
+        notes.append(f"Merged duplicate IGDB entry '{wr['name']}' ({wr['igdb_id']}) into '{twin['name']}' ({twin['igdb_id']})")
+    con.commit()
+    con.close()
+    return notes
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +1092,13 @@ async def _add_watch(game: str) -> tuple[dict | None, str]:
         image_url = await fetch_cover_url(session, result["id"])
         steam_app_id, platforms, ps_url, xbox_url, nsw_url, web_url = await fetch_game_store_info(session, result["id"])
 
+    # Already on the list under another source or spelling? Remember it so we
+    # can tell the user after the merge.
+    twins = _twin_rows({"igdb_id": result["id"], "name": result["name"], "steam_app_id": steam_app_id})
+
     upsert_game(result["id"], result["name"], release_ts, manual=True, image_url=image_url, steam_app_id=steam_app_id, platforms=platforms, ps_url=ps_url, xbox_url=xbox_url, nsw_url=nsw_url, web_url=web_url)
+    for note in reconcile_duplicates():
+        log.info(note)
     await push_watchlist_to_website()
 
     if release_ts:
@@ -1000,6 +1106,9 @@ async def _add_watch(game: str) -> tuple[dict | None, str]:
         msg = f"Now watching **{result['name']}** — releases {discord.utils.format_dt(release_dt, 'D')}."
     else:
         msg = f"Now watching **{result['name']}** (no release date yet)."
+    if twins:
+        prior = ", ".join(sorted({f"**{t['name']}**" for t in twins}))
+        msg += f"\nIt was already on the list as {prior} — merged into this entry."
     return {"igdb_id": result["id"], "name": result["name"]}, msg
 
 
@@ -1666,6 +1775,8 @@ async def _sync_high_profile() -> int:
                 new = datetime.fromtimestamp(steam_ts, tz=timezone.utc).strftime('%b %d, %Y')
                 log.info("Corrected release date for %s: %s → %s (Steam)", name, old, new)
 
+    for note in reconcile_duplicates():
+        log.info(note)
     return total
 
 
