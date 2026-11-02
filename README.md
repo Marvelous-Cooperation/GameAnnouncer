@@ -88,6 +88,6 @@ The bot is designed to run continuously. [Railway](https://railway.com) is recom
 
 - **Daily at midnight UTC** — syncs IGDB and Steam for new/updated games, announces any games launching that day
 - **Every Friday at 6pm EST** — syncs and posts the full watch list to the announcement channel
-- **Every 6 hours** — checks Steam reviews for tracked games that just launched, and scans Steam's Popular New Releases for untracked games that hit Overwhelmingly Positive within `SLEEPER_HIT_WINDOW_DAYS` (default 30) of release; each game is announced once
+- **Every 6 hours** — checks Steam reviews for tracked games that just launched, and scans Steam's Popular New Releases for untracked games that hit Overwhelmingly Positive within `SLEEPER_HIT_WINDOW_DAYS` (default 30) of release. Both require at least `REVIEW_MILESTONE_MIN_REVIEWS` reviews (default 600; Steam itself grants the label at 500). Each game is announced once
 - Game data is stored in a local SQLite database (`games.db`)
 - IGDB images (artwork/cover) and Steam header images are embedded in announcements

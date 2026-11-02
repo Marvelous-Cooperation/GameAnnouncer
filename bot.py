@@ -46,6 +46,11 @@ def date_only_ts(ts: int | None) -> int | None:
 # release get a "sleeper hit" shout-out
 SLEEPER_HIT_WINDOW_DAYS = int(os.getenv("SLEEPER_HIT_WINDOW_DAYS", "30"))
 
+# Steam grants "Overwhelmingly Positive" at 500 reviews; require a bit more
+# before shouting about it (applies to both tracked-game milestones and
+# sleeper hits). Games below the bar are simply re-checked next cycle.
+REVIEW_MILESTONE_MIN_REVIEWS = int(os.getenv("REVIEW_MILESTONE_MIN_REVIEWS", "600"))
+
 # Push the watchlist to the club website after syncs/announcements (optional)
 WEBSITE_PUSH_URL = os.getenv("WEBSITE_PUSH_URL", "")
 WEBSITE_PUSH_KEY = os.getenv("WEBSITE_PUSH_KEY", "")
@@ -1412,6 +1417,8 @@ async def _announce_review_milestones():
             summary = await fetch_steam_review_score(session, game["steam_app_id"])
             if not summary or summary.get("review_score_desc") != "Overwhelmingly Positive":
                 continue
+            if summary.get("total_reviews", 0) < REVIEW_MILESTONE_MIN_REVIEWS:
+                continue  # stays review_notified=0, so it's re-checked while in the window
 
             total = summary["total_reviews"]
             pct = round(100 * summary["total_positive"] / total)
@@ -1478,6 +1485,8 @@ async def _announce_sleeper_hits():
         for game in releases:
             if game["review_desc"] != "Overwhelmingly Positive":
                 continue
+            if game["review_total"] < REVIEW_MILESTONE_MIN_REVIEWS:
+                continue  # not recorded in sleeper_hits, so it's re-checked next cycle
             if game["release_ts"] is None or not (window_start <= game["release_ts"] <= now_ts + 86400):
                 continue
             if game["steam_id"] in already or _is_tracked_game(game["name"], game["steam_id"]):
