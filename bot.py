@@ -49,7 +49,7 @@ SLEEPER_HIT_WINDOW_DAYS = int(os.getenv("SLEEPER_HIT_WINDOW_DAYS", "30"))
 # Steam grants "Overwhelmingly Positive" at 500 reviews; require a bit more
 # before shouting about it (applies to both tracked-game milestones and
 # sleeper hits). Games below the bar are simply re-checked next cycle.
-REVIEW_MILESTONE_MIN_REVIEWS = int(os.getenv("REVIEW_MILESTONE_MIN_REVIEWS", "700"))
+REVIEW_MILESTONE_MIN_REVIEWS = int(os.getenv("REVIEW_MILESTONE_MIN_REVIEWS", "900"))
 
 # Push the watchlist to the club website after syncs/announcements (optional)
 WEBSITE_PUSH_URL = os.getenv("WEBSITE_PUSH_URL", "")
